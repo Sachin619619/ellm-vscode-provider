@@ -1,0 +1,8 @@
+{
+  "name": "corp-ellm-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stand-in enterprise LLM: chat-only, token-guarded, non-OpenAI, 5000-char response cap",
+  "scripts": { "start": "node server.js" }
+}

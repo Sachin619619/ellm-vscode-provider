@@ -1,0 +1,65 @@
+{
+  "name": "ellm-provider",
+  "displayName": "Enterprise LLM Provider",
+  "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
+  "version": "0.1.0",
+  "publisher": "sachin",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.111.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "corp-ellm",
+        "displayName": "Enterprise LLM",
+        "managementCommand": "ellm.configure"
+      }
+    ],
+    "commands": [
+      {
+        "command": "ellm.configure",
+        "title": "Enterprise LLM: Configure Connection"
+      },
+      {
+        "command": "ellm.selfTest",
+        "title": "Enterprise LLM: Run Self Test"
+      },
+      {
+        "command": "ellm.signOut",
+        "title": "Enterprise LLM: Clear Saved Token"
+      }
+    ],
+    "configuration": {
+      "title": "Enterprise LLM",
+      "properties": {
+        "ellm.url": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Base URL of the enterprise LLM, e.g. `http://127.0.0.1:9800`. Set this from **Enterprise LLM: Configure Connection**."
+        },
+        "ellm.maxResponseChars": {
+          "type": "number",
+          "default": 5000,
+          "description": "Hard per-response character cap the upstream enforces. Responses that hit it are automatically continued and stitched. 0 disables continuation."
+        },
+        "ellm.maxContinuations": {
+          "type": "number",
+          "default": 8,
+          "description": "Safety limit on how many times one answer may be continued."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^3.1.0"
+  }
+}

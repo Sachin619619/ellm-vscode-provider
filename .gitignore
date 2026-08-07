@@ -1,0 +1,7 @@
+node_modules/
+.vscode-test/
+*.vsix
+.token
+.env
+*.log
+.DS_Store
