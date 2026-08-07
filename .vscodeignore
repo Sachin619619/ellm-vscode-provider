@@ -1,6 +1,7 @@
 node_modules/**
 .vscode-test/**
 test/**
+test-server/**
 *.vsix
 .gitignore
 pnpm-lock.yaml
