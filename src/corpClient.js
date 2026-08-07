@@ -203,6 +203,7 @@ class CorpClient {
     let finish;
     let sawText = false;
     let reportedRaw = false;
+    let firstRaw = '';
 
     const handle = (raw) => {
       const events = [];
@@ -213,9 +214,10 @@ class CorpClient {
 
       // The first frame is logged verbatim: when the shape is not what this file
       // expects, that one line is the whole diagnosis.
-      if (!reportedRaw && onRawFrame) {
+      if (!reportedRaw) {
         reportedRaw = true;
-        onRawFrame(raw.slice(0, 400));
+        firstRaw = raw.slice(0, 400);
+        if (onRawFrame) onRawFrame(firstRaw);
       }
 
       let frame;
@@ -256,9 +258,12 @@ class CorpClient {
     }
 
     if (!sawText) {
+      // Carry the frame in the error itself. Telling someone to go and find it in an
+      // output channel is one step too many when the answer is right here.
       throw new Error(
-        'The endpoint streamed a response but no text could be found in it. Set ellm.textPath to '
-        + 'the field holding the text (see the first raw frame in the Enterprise LLM output channel).',
+        'The endpoint streamed a response, but none of the fields this extension knows about '
+        + 'held any text. Set "Text field path" to the key holding it, from this first frame:\n\n'
+        + `${firstRaw || '(the stream was empty)'}`,
       );
     }
 

@@ -205,7 +205,7 @@ test('SSE comments and event lines are ignored', async () => {
 test('a stream with no recognisable text says so instead of returning silence', async () => {
   await assert.rejects(
     () => withFetch(response({ frames: ['{"unexpected":{"nested":1}}'] }), () => converse(client())),
-    /no text could be found.*ellm\.textPath/s,
+    /none of the fields this extension knows about.*unexpected/s,
   );
 });
 
