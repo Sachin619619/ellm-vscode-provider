@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -95,6 +95,11 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Dot-path to the text inside a streamed frame, e.g. `delta.text`. Leave blank to auto-detect; set it if the auto-detect picks the wrong field."
+        },
+        "ellm.servedModelPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Dot-path to the model name inside a streamed frame, e.g. `metadata.model`. Leave blank to auto-detect. Used to warn when the backend serves a different model than the one you picked \u2014 an unknown model name is usually answered with the backend's default rather than an error."
         },
         "ellm.promptField": {
           "type": "string",

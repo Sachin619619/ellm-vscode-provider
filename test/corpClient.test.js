@@ -8,7 +8,9 @@
  */
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { CorpClient, CorpAuthError, textFrom, finishFrom } = require('../src/corpClient');
+const {
+  CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
+} = require('../src/corpClient');
 
 /** Minimal stand-in for a fetch Response, streaming `frames` as SSE lines. */
 function response({ status = 200, body = '', contentType = 'text/event-stream', frames }) {
@@ -343,4 +345,88 @@ test('a frame carrying no text is skipped silently, not shown', async () => {
   const body = '{"statusCode":200,"headers":{}}{"completionText":"only this"}';
   const { value } = await withFetch(response({ body }), () => converse(client()));
   assert.strictEqual(value.text, 'only this');
+});
+
+// --- which model actually answered -------------------------------------------
+// Nothing validates the model name on the way out, and a backend that does not
+// recognise it answers with its default rather than an error. These pin the
+// read-back that makes that substitution visible.
+
+test('modelFrom finds the served model across the shapes backends use', () => {
+  assert.strictEqual(modelFrom({ model: 'gpt-4o' }), 'gpt-4o');
+  assert.strictEqual(modelFrom({ modelId: 'internal-7b' }), 'internal-7b');
+  assert.strictEqual(modelFrom({ metadata: { model: 'nested-1' } }), 'nested-1');
+  assert.strictEqual(modelFrom({ model: 42 }), '');
+  assert.strictEqual(modelFrom({ text: 'hi' }), '');
+});
+
+test('modelFrom honours an explicit path over the guesses', () => {
+  const frame = { model: 'wrapper', payload: { engine: 'real-one' } };
+  assert.strictEqual(modelFrom(frame, 'payload.engine'), 'real-one');
+});
+
+test('sameModel treats a more specific served name as a match', () => {
+  assert.ok(sameModel('gpt-4o', 'gpt-4o-2026-01-15'));
+  assert.ok(sameModel('Internal-7B', 'internal_7b'));
+  assert.ok(sameModel('opus-5', 'opus5'));
+  // Nothing to compare is not a mismatch - most frames name no model at all.
+  assert.ok(sameModel('opus-5', ''));
+  assert.ok(sameModel('', 'anything'));
+});
+
+test('sameModel flags a genuinely different model', () => {
+  assert.ok(!sameModel('opus 5.1', 'internal-default-7b'));
+  assert.ok(!sameModel('gpt-4o', 'claude-sonnet'));
+});
+
+test('converse reports a mismatch when the backend substitutes its default', async () => {
+  const seenModels = [];
+  await withFetch(
+    response({ frames: ['{"model":"internal-default-7b","text":"hi"}'] }),
+    () => converse(client(), {
+      modelAlias: 'opus 5.1',
+      onServedModel: (m) => seenModels.push(m),
+    }),
+  );
+  assert.deepStrictEqual(seenModels, [
+    { requested: 'opus 5.1', served: 'internal-default-7b', matches: false },
+  ]);
+});
+
+test('converse reports a match without complaining about it', async () => {
+  const seenModels = [];
+  await withFetch(
+    response({ frames: ['{"model":"internal-7b-2026","text":"hi"}'] }),
+    () => converse(client(), {
+      modelAlias: 'internal-7b',
+      onServedModel: (m) => seenModels.push(m),
+    }),
+  );
+  assert.strictEqual(seenModels.length, 1);
+  assert.ok(seenModels[0].matches);
+});
+
+test('the served model is reported once, not on every frame', async () => {
+  const seenModels = [];
+  await withFetch(
+    response({ frames: ['{"model":"m-1","text":"a"}', '{"model":"m-1","text":"b"}'] }),
+    () => converse(client(), {
+      modelAlias: 'm-1',
+      onServedModel: (m) => seenModels.push(m),
+    }),
+  );
+  assert.strictEqual(seenModels.length, 1);
+});
+
+test('a stream that names no model reports nothing rather than a false alarm', async () => {
+  const seenModels = [];
+  const { value } = await withFetch(
+    response({ frames: ['{"text":"hi"}'] }),
+    () => converse(client(), {
+      modelAlias: 'opus 5.1',
+      onServedModel: (m) => seenModels.push(m),
+    }),
+  );
+  assert.strictEqual(seenModels.length, 0);
+  assert.strictEqual(value.text, 'hi');
 });

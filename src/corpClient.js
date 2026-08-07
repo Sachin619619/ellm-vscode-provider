@@ -76,6 +76,18 @@ const FINISH_KEYS = ['stopReason', 'stop_reason', 'finishReason', 'finish_reason
 /** Frame-level markers that mean "the answer was cut short, ask for the rest". */
 const TRUNCATED = /^(charlimit|length|max_tokens|max_output_tokens|truncated)$/i;
 
+/**
+ * Where a frame names the model that actually served it. Nothing validates the
+ * model name on the way out - the body carries whatever was configured - so an
+ * unknown name reaches a backend that is free to quietly serve its default
+ * instead. That substitution is invisible in the answer, which is exactly why it
+ * is worth reading back. `ellm.servedModelPath` overrides the guessing.
+ */
+const MODEL_PATHS = [
+  'model', 'modelId', 'model_id', 'modelAlias', 'modelName', 'model_name',
+  'engine', 'deployment', 'metadata.model', 'payload.model', 'data.model',
+];
+
 function dig(obj, path) {
   return path.split('.').reduce((acc, key) => (acc == null ? undefined : acc[key]), obj);
 }
@@ -94,6 +106,35 @@ function textFrom(frame, override) {
     if (typeof found === 'string' && found) return found;
   }
   return '';
+}
+
+/** The model a parsed frame says served it, or '' if it names none. */
+function modelFrom(frame, override) {
+  if (!frame || typeof frame !== 'object') return '';
+
+  if (override) {
+    const found = dig(frame, override);
+    return typeof found === 'string' ? found.trim() : '';
+  }
+  for (const path of MODEL_PATHS) {
+    const found = dig(frame, path);
+    if (typeof found === 'string' && found.trim()) return found.trim();
+  }
+  return '';
+}
+
+/**
+ * Whether a served name is the model that was asked for. Backends routinely
+ * answer with a longer, more specific name than the one requested - a pinned
+ * snapshot, a deployment id, a different case - so "asked for X, got X-2026-01"
+ * is a match. Only a name with no relation to the request is a real mismatch.
+ */
+function sameModel(requested, served) {
+  const key = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const a = key(requested);
+  const b = key(served);
+  if (!a || !b) return true; // nothing to compare is not a mismatch
+  return a.includes(b) || b.includes(a);
 }
 
 /** 'stop' | 'length' | undefined - whether the backend says it stopped early. */
@@ -144,7 +185,8 @@ async function failureFor(res, url, client) {
 class CorpClient {
   constructor({
     url, token, authHeader, authPrefix, cookie, chatPath, promptField,
-    model, models, identity, params, textPath, contextChars, maxResponseChars,
+    model, models, identity, params, textPath, servedModelPath,
+    contextChars, maxResponseChars,
   } = {}) {
     // Which body key carries the prompt is the backend's business, not this file's.
     this.promptField = promptField || DEFAULT_PROMPT_FIELD;
@@ -159,6 +201,7 @@ class CorpClient {
     this.identity = identity || {};
     this.params = params || {};
     this.textPath = textPath || '';
+    this.servedModelPath = servedModelPath || '';
     this.contextChars = contextChars || 400000;
     this.maxResponseChars = maxResponseChars || 5000;
   }
@@ -224,7 +267,7 @@ class CorpClient {
   }
 
   /** Yields { type:'text', text } then a final { type:'finish', reason }. */
-  async *converse({ modelAlias, turns, signal, onRawFrame }) {
+  async *converse({ modelAlias, turns, signal, onRawFrame, onServedModel }) {
     const url = this.endpoint;
     const res = await fetch(url, {
       method: 'POST',
@@ -243,6 +286,19 @@ class CorpClient {
     let sawText = false;
     let reportedRaw = false;
     let firstRaw = '';
+    let reportedModel = false;
+    const requested = modelAlias || this.model;
+
+    const noteModel = (frame) => {
+      // Read the served model off the first frame that names one. Reported even
+      // when it matches, so the output channel always answers "which model was
+      // that?" without a second run.
+      if (reportedModel || !onServedModel) return;
+      const served = modelFrom(frame, this.servedModelPath);
+      if (!served) return;
+      reportedModel = true;
+      onServedModel({ requested, served, matches: sameModel(requested, served) });
+    };
 
     const noteRaw = (raw) => {
       // The first frame is recorded verbatim: when the shape is not what this file
@@ -270,6 +326,7 @@ class CorpClient {
         return [{ type: 'text', text: raw }];
       }
 
+      noteModel(frame);
       finish = finishFrom(frame) ?? finish;
       const text = textFrom(frame, this.textPath);
       if (!text) return []; // an envelope or a keep-alive, carrying nothing to show
@@ -361,4 +418,4 @@ class CorpClient {
   }
 }
 
-module.exports = { CorpClient, CorpAuthError, textFrom, finishFrom };
+module.exports = { CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel };

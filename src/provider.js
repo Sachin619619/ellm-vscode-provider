@@ -27,6 +27,9 @@ class EllmChatProvider {
     this.output = output;
     this._onDidChange = new vscode.EventEmitter();
     this.onDidChangeLanguageModelChatInformation = this._onDidChange.event;
+    // Mismatches repeat on every request of a session; warn on each distinct
+    // pair once so a wrong model is visible without becoming noise.
+    this.warnedModels = new Set();
   }
 
   refresh() {
@@ -49,6 +52,7 @@ class EllmChatProvider {
       models: String(readSetting(this.context, 'models', ''))
         .split(',').map((s) => s.trim()).filter(Boolean),
       textPath: readSetting(this.context, 'textPath', ''),
+      servedModelPath: readSetting(this.context, 'servedModelPath', ''),
       maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
       // Identity and tuning are private to this machine - see storage.js.
       identity: getPrivate(this.context, 'identity', {}),
@@ -120,6 +124,7 @@ class EllmChatProvider {
         // One verbatim frame per request: if the backend changes shape, this line
         // is the difference between a five-minute fix and an afternoon.
         onRawFrame: (raw) => this.log(`first raw frame: ${raw}`),
+        onServedModel: (served) => this.reportServedModel(served),
       });
 
       const stream = withContinuation(rounds, turns, {
@@ -170,6 +175,31 @@ class EllmChatProvider {
     } finally {
       sub.dispose();
     }
+  }
+
+  /**
+   * Nothing between the picker and the backend validates a model name, so asking
+   * for one that does not exist gets a normal-looking answer from whatever the
+   * backend falls back to. Say so out loud rather than letting a silent
+   * substitution pass for a working configuration.
+   */
+  reportServedModel({ requested, served, matches }) {
+    if (matches) {
+      this.log(`served by: ${served}`);
+      return;
+    }
+
+    this.log(`MODEL MISMATCH: asked for "${requested}", served by "${served}"`);
+    const pair = `${requested} ${served}`;
+    if (this.warnedModels.has(pair)) return;
+    this.warnedModels.add(pair);
+
+    vscode.window.showWarningMessage(
+      `Enterprise LLM answered as "${served}", not the "${requested}" you picked. `
+      + 'The backend does not recognise that name and substituted its default - '
+      + 'check the model list in the connection panel.',
+      'Configure',
+    ).then((pick) => pick === 'Configure' && vscode.commands.executeCommand('ellm.configure'));
   }
 
   /** VS Code chat messages -> the enterprise LLM's {speaker, utterance} turns. */

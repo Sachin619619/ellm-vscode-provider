@@ -102,6 +102,7 @@ function openConfigPanel(context, provider) {
           promptField,
           models: models.split(',').map((s) => s.trim()).filter(Boolean),
           textPath,
+          servedModelPath: readSetting(context, 'servedModelPath', ''),
           identity,
           params,
         });
@@ -148,11 +149,13 @@ async function smokeTest(client) {
   const started = Date.now();
   let text = '';
   let firstFrame = '';
+  let servedModel = null;
 
   const stream = client.converse({
     modelAlias: client.models[0]?.alias ?? client.models[0] ?? undefined,
     turns: [{ speaker: 'human', utterance: 'Reply with exactly: OK' }],
     onRawFrame: (raw) => { firstFrame = raw; },
+    onServedModel: (served) => { servedModel = served; },
   });
 
   for await (const ev of stream) {
@@ -163,7 +166,20 @@ async function smokeTest(client) {
   if (!text.trim()) {
     throw new Error(`The endpoint answered but no text came back. First frame: ${firstFrame || '(none)'}`);
   }
-  return `Connected in ${Date.now() - started}ms. The model replied: ${JSON.stringify(text.trim().slice(0, 80))}`;
+
+  let note = '';
+  if (servedModel && !servedModel.matches) {
+    // A wrong model name still answers, so this is the only place the
+    // substitution is visible before it silently shapes every later reply.
+    note = `\n\nMODEL MISMATCH: you asked for "${servedModel.requested}" but the reply came `
+      + `from "${servedModel.served}". The backend does not recognise that name and used its `
+      + 'default instead - fix the model list above.';
+  } else if (servedModel) {
+    note = `\n\nServed by: ${servedModel.served}`;
+  }
+
+  return `Connected in ${Date.now() - started}ms. The model replied: `
+    + `${JSON.stringify(text.trim().slice(0, 80))}${note}`;
 }
 
 function nonce() {
