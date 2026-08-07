@@ -61,5 +61,21 @@
   },
   "devDependencies": {
     "@vscode/test-electron": "^3.1.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sachin619619/ellm-vscode-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Sachin619619/ellm-vscode-provider/issues"
+  },
+  "homepage": "https://github.com/Sachin619619/ellm-vscode-provider#readme",
+  "keywords": [
+    "llm",
+    "chat",
+    "agent",
+    "language model provider",
+    "enterprise",
+    "byok"
+  ]
 }
