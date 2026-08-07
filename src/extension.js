@@ -36,7 +36,32 @@ async function activate(context) {
     vscode.commands.registerCommand('ellm.selfTest', () => runSelfTest(output)),
   );
 
+  await promptIfUnconfigured(context, provider);
   return { provider };
+}
+
+/**
+ * The extension contributes no view of its own, and models stay hidden from the
+ * picker until a connection works - so a fresh install looks like nothing happened.
+ * Say so once, then never again.
+ */
+async function promptIfUnconfigured(context, provider) {
+  const url = vscode.workspace.getConfiguration('ellm').get('url');
+  const token = await context.secrets.get(SECRET_KEY);
+  if (url && token) return;
+
+  if (context.globalState.get('ellm.welcomed')) {
+    output.appendLine('not configured - run "Enterprise LLM: Configure Connection"');
+    return;
+  }
+  await context.globalState.update('ellm.welcomed', true);
+
+  const choice = await vscode.window.showInformationMessage(
+    'Enterprise LLM is installed. Add your endpoint URL and auth token to see its models in the chat model picker.',
+    'Configure',
+    'Later',
+  );
+  if (choice === 'Configure') openConfigPanel(context, provider);
 }
 
 /**
