@@ -6,3 +6,4 @@ test-server/**
 .gitignore
 pnpm-lock.yaml
 package-lock.json
+tools/**

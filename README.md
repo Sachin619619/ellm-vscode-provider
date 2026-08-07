@@ -119,6 +119,33 @@ and the response frame shape. Then rewrite `src/corpClient.js` to match — it's
 only has to yield `{type:'text', text}` events and a final `{type:'finish', reason}`, where
 `reason: 'length'` means "was truncated, please continue".
 
+Internal endpoints are usually confidential, and a HAR capture is full of live tokens. If you
+want that shape written down — or reviewed by someone else — without the secrets going with it,
+save the capture (**Save all as HAR with content**) and run:
+
+```bash
+node tools/describe-har.js capture.har
+```
+
+It reads the file locally, sends nothing anywhere, and prints structure only — every value
+replaced by its type, hostnames and query values redacted:
+
+```
+## 1. POST https://<host>/api/v3/chat/stream?tenant=<value>
+  request headers:
+    Authorization: <redacted:45>
+    content-type: application/json
+  request body:
+    { modelAlias: <string:9>, turns: [ { speaker: <string:5>, utterance: <string:8> } ], streaming: <boolean> }
+  response: 200 text/event-stream
+  response frames:
+    { event: <string>, payload: { deltaText: <string> } }
+    { event: <string>, stopReason: <string>, charCount: <number> }
+```
+
+That is everything `corpClient.js` needs, and it is short enough to read line by line before
+you decide it is shareable. Pass `--hosts` to keep hostnames.
+
 Set `ellm.maxResponseChars` to your backend's cap (0 disables continuation) and
 `ellm.maxContinuations` to bound how many rounds a single answer may take.
 
