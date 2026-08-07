@@ -18,6 +18,8 @@ function openConfigPanel(context, provider) {
       type: 'state',
       url: readSetting(context, 'url', ''),
       tokenLocation: await tokenLocation(context),
+      authHeader: readSetting(context, 'authHeader', 'X-Corp-Auth'),
+      authPrefix: readSetting(context, 'authPrefix', ''),
       maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
       maxContinuations: readSetting(context, 'maxContinuations', 8),
     });
@@ -42,8 +44,13 @@ function openConfigPanel(context, provider) {
         // and it must not be lost to an unrelated settings.json problem.
         const tokenWarning = msg.token ? await setToken(context, String(msg.token)) : null;
 
+        const authHeader = String(msg.authHeader || '').trim() || 'X-Corp-Auth';
+        const authPrefix = String(msg.authPrefix ?? '');
+
         const settingsWarning = await saveSettings(context, {
           url,
+          authHeader,
+          authPrefix,
           maxResponseChars: Number(msg.maxResponseChars) || 5000,
           maxContinuations: Number(msg.maxContinuations) || 8,
         });
@@ -51,7 +58,7 @@ function openConfigPanel(context, provider) {
         const token = await getToken(context);
         if (!token) throw new Error('Enter the auth token.');
 
-        const info = await new CorpClient({ url, token }).listModels();
+        const info = await new CorpClient({ url, token, authHeader, authPrefix }).listModels();
         provider.refresh();
         await pushState();
 
@@ -118,9 +125,20 @@ function html(webview) {
   <label>Endpoint URL <span class="hint">— base URL, no path</span></label>
   <input id="url" placeholder="http://127.0.0.1:9800" />
 
-  <label>Auth token <span class="hint">— sent as the X-Corp-Auth header</span></label>
+  <label>Auth token</label>
   <input id="token" type="password" placeholder="paste token" />
   <div class="saved" id="saved"></div>
+
+  <div class="grid">
+    <div>
+      <label>Auth header <span class="hint">— what the token is sent in</span></label>
+      <input id="authHeader" placeholder="X-Corp-Auth" />
+    </div>
+    <div>
+      <label>Token prefix <span class="hint">— e.g. "Bearer " (keep the space)</span></label>
+      <input id="authPrefix" placeholder="(none)" />
+    </div>
+  </div>
 
   <div class="grid">
     <div>
@@ -148,6 +166,8 @@ function html(webview) {
     const m = e.data;
     if (m.type === 'state') {
       $('url').value = m.url || '';
+      $('authHeader').value = m.authHeader || '';
+      $('authPrefix').value = m.authPrefix || '';
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
       $('saved').textContent = m.tokenLocation
@@ -168,6 +188,8 @@ function html(webview) {
       type: 'save',
       url: $('url').value,
       token: $('token').value,
+      authHeader: $('authHeader').value,
+      authPrefix: $('authPrefix').value,
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
     });

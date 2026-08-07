@@ -41,6 +41,8 @@ class EllmChatProvider {
     return new CorpClient({
       url: readSetting(this.context, 'url', ''),
       token: await getToken(this.context),
+      authHeader: readSetting(this.context, 'authHeader', 'X-Corp-Auth'),
+      authPrefix: readSetting(this.context, 'authPrefix', ''),
     });
   }
 

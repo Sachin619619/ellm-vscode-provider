@@ -23,7 +23,7 @@ so your models appear in the normal model picker next to everything else.
 Grab the `.vsix` from [Releases](../../releases) and:
 
 ```bash
-code --install-extension ellm-provider-0.1.2.vsix
+code --install-extension ellm-provider-0.1.3.vsix
 ```
 
 Requires VS Code 1.104 or newer.
@@ -87,6 +87,30 @@ Models improvise, so the scanner is forgiving about how the call actually arrive
 - a **bare, untagged** `{"name": …, "arguments": …}` answer is recognised as the call it is
 - genuinely malformed JSON inside the tags *is* shown as text, so the model can self-correct
 
+## “Token rejected by the enterprise LLM”
+
+Nine times out of ten the token is fine and the **request** is wrong. A server that has never
+heard of the path you asked for answers `401` just as readily as one that dislikes your token,
+so the error now reports the status, the URL it tried and whatever the server said back. Read
+that line before touching the token:
+
+| What you see | What it means |
+|---|---|
+| `No such endpoint (404 …/corp/v2/models)` | The extension is still speaking the bundled **sample** protocol. Your real API lives somewhere else — `src/corpClient.js` has to be rewritten. |
+| `answered with a web page rather than an API response` | The URL is the chat site, not its API. A browser session cookie is not an API token. |
+| `Token rejected (401 …). Server said: …` | A real rejection — or the right token in the wrong header. Try `Authorization` + `Bearer `. |
+
+The auth header is settable without touching code, since that alone is often the whole
+difference:
+
+| setting | default | typical alternative |
+|---|---|---|
+| `ellm.authHeader` | `X-Corp-Auth` | `Authorization` |
+| `ellm.authPrefix` | *(empty)* | `Bearer ` — keep the trailing space |
+
+Both are on the config panel. The request **paths and body shape** are not configurable, because
+guessing those is worse than being told — see below.
+
 ## Adapting it to your LLM
 
 Open your company chat UI → DevTools → Network → send a message → find the request that
@@ -116,7 +140,7 @@ Point the extension at `http://127.0.0.1:9800` with that token.
 
 ```bash
 npm install
-npm test                  # fast, deterministic: the tool-call scanner
+npm test                  # fast, deterministic: the tool-call scanner and client errors
 npm run test:e2e          # launches real VS Code and drives the genuine vscode.lm API
 ```
 

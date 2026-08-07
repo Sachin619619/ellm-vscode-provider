@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -46,6 +46,16 @@
           "default": "",
           "markdownDescription": "Base URL of the enterprise LLM, e.g. `http://127.0.0.1:9800`. Set this from **Enterprise LLM: Configure Connection**."
         },
+        "ellm.authHeader": {
+          "type": "string",
+          "default": "X-Corp-Auth",
+          "markdownDescription": "HTTP header the auth token is sent in. Many APIs want `Authorization` instead — set `#ellm.authPrefix#` to `Bearer ` if so."
+        },
+        "ellm.authPrefix": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Text placed before the token in the auth header, e.g. `Bearer ` (keep the trailing space). Empty means the raw token is sent."
+        },
         "ellm.maxResponseChars": {
           "type": "number",
           "default": 5000,
@@ -75,7 +85,7 @@
     }
   },
   "scripts": {
-    "test": "node --test test/toolshim.test.js",
+    "test": "node --test test/*.test.js",
     "test:e2e": "node test/runTest.js"
   },
   "devDependencies": {
