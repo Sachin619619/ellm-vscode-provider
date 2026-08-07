@@ -25,6 +25,10 @@ const PORT = Number(process.env.PORT || 9800);
 const CHAR_CAP = Number(process.env.CHAR_CAP || 5000);
 const TOKEN = process.env.CORP_TOKEN || readFileSync(join(HERE, '.token'), 'utf8').trim();
 const OLLAMA = process.env.OLLAMA_URL || 'http://127.0.0.1:11434/v1/chat/completions';
+// Which body key carries the prompt, matching the extension's `ellm.promptField`.
+const PROMPT_FIELD = process.env.PROMPT_FIELD || 'prompt';
+// Header the token arrives in, matching `ellm.authHeader`.
+const AUTH_HEADER = (process.env.AUTH_HEADER || 'X-Corp-Auth').toLowerCase();
 
 const MODELS = [
   { alias: 'corp-fast', label: 'Corp Fast', upstream: 'gpt-oss:120b-cloud', contextChars: 400000 },
@@ -46,16 +50,26 @@ async function readBody(req) {
 }
 
 async function handleConverse(req, res) {
-  if ((req.headers['x-corp-auth'] || '') !== TOKEN) {
-    return json(res, 401, { event: 'error', code: 'INVALID_TOKEN', message: 'X-Corp-Auth missing or expired' });
+  const presented = req.headers[AUTH_HEADER] || '';
+  // Tolerate a "Bearer "-style prefix so either auth style can be exercised.
+  if (presented.replace(/^\S+\s+/, '') !== TOKEN && presented !== TOKEN) {
+    return json(res, 401, {
+      event: 'error', code: 'INVALID_TOKEN', message: `${AUTH_HEADER} missing or expired`,
+    });
   }
 
   const body = await readBody(req);
-  const model = MODELS.find((m) => m.alias === body.modelAlias) ?? MODELS[0];
-  const messages = (body.turns ?? []).map((t) => ({
-    role: SPEAKER_TO_ROLE[t.speaker] ?? 'user',
-    content: t.utterance ?? '',
-  }));
+  const wanted = body.modelAlias ?? body.model;
+  const model = MODELS.find((m) => m.alias === wanted) ?? MODELS[0];
+
+  // Two request shapes: a turn list, or the single prompt field real gateways
+  // tend to expose. Whichever arrives, it ends up as chat messages here.
+  const messages = Array.isArray(body.turns) && body.turns.length
+    ? body.turns.map((t) => ({
+      role: SPEAKER_TO_ROLE[t.speaker] ?? 'user',
+      content: t.utterance ?? '',
+    }))
+    : [{ role: 'user', content: String(body[PROMPT_FIELD] ?? '') }];
 
   const upstream = await fetch(OLLAMA, {
     method: 'POST',

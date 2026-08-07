@@ -23,7 +23,7 @@ so your models appear in the normal model picker next to everything else.
 Grab the `.vsix` from [Releases](../../releases) and:
 
 ```bash
-code --install-extension ellm-provider-0.1.3.vsix
+code --install-extension ellm-provider-0.2.0.vsix
 ```
 
 Requires VS Code 1.104 or newer.
@@ -54,11 +54,32 @@ extension's own storage, and everything keeps working.
 ## The three problems it solves
 
 **1. The wire format isn't OpenAI.** All translation lives in
-[`src/corpClient.js`](src/corpClient.js) — the only file you need to touch to point this at a
-different backend. Everything above it consumes a neutral `{type:'text'|'finish'}` event
-stream. The bundled example speaks `{modelAlias, turns:[{speaker, utterance}]}` and reads back
-`{event:"chunk", payload:{deltaText}}` SSE frames, with the token on a custom `X-Corp-Auth`
-header rather than `Authorization: Bearer`.
+[`src/corpClient.js`](src/corpClient.js). Everything above it consumes a neutral
+`{type:'text'|'finish'}` event stream.
+
+Most of the differences between backends are *configuration*, not code, so for a large class of
+gateways there is nothing to write at all:
+
+| setting | what it is | default |
+|---|---|---|
+| `ellm.url` | origin | — |
+| `ellm.chatPath` | path of the streaming endpoint | `/chat` |
+| `ellm.authHeader` | header the token rides in | `X-Corp-Auth` |
+| `ellm.authPrefix` | text before the token, e.g. `Bearer ` | *(none)* |
+| `ellm.promptField` | body key holding the prompt | `prompt` |
+| `ellm.models` | model names, comma separated | — |
+| `ellm.textPath` | dot-path to the text in a frame | *(auto-detect)* |
+
+Two more live in the panel rather than `settings.json`, because they are private: a **Cookie**
+header, for gateways that want signed cookies alongside the token, and an **extra request
+fields** JSON object merged into every request body — the tenant, region and user block some
+backends require. Streamed frames are read tolerantly: the text is found in whichever of ~12
+common shapes the backend uses, and the first raw frame is logged to the *Enterprise LLM*
+output channel so an unknown shape is a one-line diagnosis rather than a mystery.
+
+Backends that keep conversation history server-side are handled too: VS Code replays the whole
+conversation every turn, so the turn list is flattened into one labelled prompt and server-side
+memory is left off — otherwise every turn is remembered twice.
 
 **2. Responses are capped.** Many internal gateways cut each response at a fixed size (5000
 characters in the bundled example). That silently guillotines a generated file mid-function,
@@ -96,27 +117,34 @@ that line before touching the token:
 
 | What you see | What it means |
 |---|---|
-| `No such endpoint (404 …/corp/v2/models)` | The extension is still speaking the bundled **sample** protocol. Your real API lives somewhere else — `src/corpClient.js` has to be rewritten. |
-| `answered with a web page rather than an API response` | The URL is the chat site, not its API. A browser session cookie is not an API token. |
-| `Token rejected (401 …). Server said: …` | A real rejection — or the right token in the wrong header. Try `Authorization` + `Bearer `. |
+| `No such endpoint (404 …)` | The chat path is wrong. Fix it in the panel. |
+| `answered with a web page rather than an API response` | The URL is the chat site, not its API — or a cookie the gateway wants is missing. A browser session cookie is not an API token. |
+| `Token rejected (401 …). Server said: …` | A real rejection — or the right token in the wrong header. Try `Authorization`, and check whether a prefix is expected. |
+| `streamed a response but no text could be found` | The connection works. Read the `first raw frame:` line in the *Enterprise LLM* output channel and set `ellm.textPath`. |
 
-The auth header is settable without touching code, since that alone is often the whole
-difference:
+The header the token rides in is the single most common mismatch, and it needs no code change:
 
 | setting | default | typical alternative |
 |---|---|---|
 | `ellm.authHeader` | `X-Corp-Auth` | `Authorization` |
 | `ellm.authPrefix` | *(empty)* | `Bearer ` — keep the trailing space |
 
-Both are on the config panel. The request **paths and body shape** are not configurable, because
-guessing those is worse than being told — see below.
+Both are on the config panel. Note that plenty of gateways expect the **raw** token with no
+prefix at all, so an empty prefix is a real answer, not an unfinished one.
 
 ## Adapting it to your LLM
 
 Open your company chat UI → DevTools → Network → send a message → find the request that
-streams the answer. You need the endpoint URL, the auth header name, the request body shape,
-and the response frame shape. Then rewrite `src/corpClient.js` to match — it's ~90 lines and
-only has to yield `{type:'text', text}` events and a final `{type:'finish', reason}`, where
+streams the answer. You need the endpoint URL, the path, the auth header name, the request body
+shape, and the response frame shape.
+
+**Try the settings first.** If the backend takes a prompt in one body field and streams SSE
+back, the panel alone will do it: URL, chat path, auth header, prompt field, model name, plus
+any constant fields the body needs in the *extra request fields* box. No code change.
+
+Only if the shape is stranger than that — a turn list with an unusual schema, a non-SSE
+transport, a two-step submit-then-poll flow — does `src/corpClient.js` need editing. It only has
+to yield `{type:'text', text}` events and a final `{type:'finish', reason}`, where
 `reason: 'length'` means "was truncated, please continue".
 
 Internal endpoints are usually confidential, and a HAR capture is full of live tokens. If you

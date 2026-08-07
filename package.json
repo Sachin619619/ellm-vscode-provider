@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -80,6 +80,26 @@
             "OS keychain via SecretStorage. Encrypted, but unavailable on some managed machines."
           ],
           "markdownDescription": "Where the auth token is stored. `keychain` is the only encrypted option, but locked-down machines may refuse it — in that case the token falls back to global storage and the panel tells you."
+        },
+        "ellm.chatPath": {
+          "type": "string",
+          "default": "/chat",
+          "markdownDescription": "Path of the streaming chat endpoint, appended to `#ellm.url#`. Set it from **Enterprise LLM: Configure Connection**."
+        },
+        "ellm.models": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Comma-separated model names, exactly as the backend names them. There is no discovery endpoint, so this is the model list shown in the picker."
+        },
+        "ellm.textPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Dot-path to the text inside a streamed frame, e.g. `delta.text`. Leave blank to auto-detect; set it if the auto-detect picks the wrong field."
+        },
+        "ellm.promptField": {
+          "type": "string",
+          "default": "prompt",
+          "markdownDescription": "Body field the prompt is sent in, e.g. `prompt`, `message`, `input`. Whatever your backend calls it."
         }
       }
     }

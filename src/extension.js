@@ -17,7 +17,13 @@ async function activate(context) {
   const underTest = context.extensionMode === vscode.ExtensionMode.Test
     || context.extensionMode === vscode.ExtensionMode.Development;
   if (underTest && process.env.ELLM_TEST_URL && process.env.ELLM_TEST_TOKEN) {
-    await saveSettings(context, { url: process.env.ELLM_TEST_URL });
+    await saveSettings(context, {
+      url: process.env.ELLM_TEST_URL,
+      chatPath: process.env.ELLM_TEST_CHAT_PATH || '/chat',
+      promptField: process.env.ELLM_TEST_PROMPT_FIELD || 'prompt',
+      models: process.env.ELLM_TEST_MODELS || '',
+      authHeader: process.env.ELLM_TEST_AUTH_HEADER || 'X-Corp-Auth',
+    });
     await setToken(context, process.env.ELLM_TEST_TOKEN);
     output.appendLine(`seeded connection from env: ${process.env.ELLM_TEST_URL}`);
   }

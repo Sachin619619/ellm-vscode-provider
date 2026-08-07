@@ -2,7 +2,7 @@ const vscode = require('vscode');
 const { CorpClient, CorpAuthError } = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const { buildToolPrompt, ToolCallScanner } = require('./toolshim');
-const { getToken, readSetting } = require('./storage');
+const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
 
 /** Read a VS Code message part without depending on class identity across API versions. */
 function partToPieces(part) {
@@ -41,8 +41,18 @@ class EllmChatProvider {
     return new CorpClient({
       url: readSetting(this.context, 'url', ''),
       token: await getToken(this.context),
+      cookie: await getCookie(this.context),
       authHeader: readSetting(this.context, 'authHeader', 'X-Corp-Auth'),
       authPrefix: readSetting(this.context, 'authPrefix', ''),
+      chatPath: readSetting(this.context, 'chatPath', '/chat'),
+      promptField: readSetting(this.context, 'promptField', 'prompt'),
+      models: String(readSetting(this.context, 'models', ''))
+        .split(',').map((s) => s.trim()).filter(Boolean),
+      textPath: readSetting(this.context, 'textPath', ''),
+      maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
+      // Identity and tuning are private to this machine - see storage.js.
+      identity: getPrivate(this.context, 'identity', {}),
+      params: getPrivate(this.context, 'params', {}),
     });
   }
 
@@ -107,6 +117,9 @@ class EllmChatProvider {
         modelAlias: model.id,
         turns: roundTurns,
         signal,
+        // One verbatim frame per request: if the backend changes shape, this line
+        // is the difference between a five-minute fix and an afternoon.
+        onRawFrame: (raw) => this.log(`first raw frame: ${raw}`),
       });
 
       const stream = withContinuation(rounds, turns, {

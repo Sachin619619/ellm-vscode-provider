@@ -1,12 +1,21 @@
 const vscode = require('vscode');
 const { CorpClient } = require('./corpClient');
-const { getToken, setToken, clearToken, tokenLocation, readSetting, saveSettings } = require('./storage');
+const {
+  getToken, setToken, clearToken, tokenLocation, getCookie, setCookie,
+  getPrivate, setPrivate, readSetting, saveSettings, COOKIE_KEY, clearSecret,
+} = require('./storage');
 
-/** Webview where the auth token and endpoint are entered. See storage.js for where the token lands. */
+/**
+ * Webview where the connection is entered. Everything the backend needs that is
+ * specific to a person or a company - credentials, the identity block, the model
+ * name - is typed here rather than living in the source, so the code stays plain
+ * and the confidential parts never leave this machine. See storage.js for where
+ * each piece lands.
+ */
 function openConfigPanel(context, provider) {
   const panel = vscode.window.createWebviewPanel(
     'ellmConfig',
-    'Enterprise LLM: Connection',
+    'Enterprise LLM',
     vscode.ViewColumn.Active,
     { enableScripts: true, retainContextWhenHidden: true },
   );
@@ -17,9 +26,16 @@ function openConfigPanel(context, provider) {
     panel.webview.postMessage({
       type: 'state',
       url: readSetting(context, 'url', ''),
+      chatPath: readSetting(context, 'chatPath', '/chat'),
+      promptField: readSetting(context, 'promptField', 'prompt'),
       tokenLocation: await tokenLocation(context),
+      hasCookie: Boolean(await getCookie(context)),
       authHeader: readSetting(context, 'authHeader', 'X-Corp-Auth'),
       authPrefix: readSetting(context, 'authPrefix', ''),
+      models: readSetting(context, 'models', ''),
+      textPath: readSetting(context, 'textPath', ''),
+      identity: JSON.stringify(getPrivate(context, 'identity', {}), null, 2),
+      params: JSON.stringify(getPrivate(context, 'params', {}), null, 2),
       maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
       maxContinuations: readSetting(context, 'maxContinuations', 8),
     });
@@ -31,44 +47,75 @@ function openConfigPanel(context, provider) {
 
       if (msg.type === 'clear') {
         await clearToken(context);
+        await clearSecret(context, COOKIE_KEY);
         provider.refresh();
         await pushState();
-        return panel.webview.postMessage({ type: 'result', ok: true, message: 'Saved token cleared.' });
+        return panel.webview.postMessage({
+          type: 'result', ok: true, message: 'Saved token and cookie cleared.',
+        });
       }
 
       if (msg.type === 'save') {
         const url = String(msg.url || '').trim().replace(/\/+$/, '');
         if (!url) throw new Error('Enter the enterprise LLM URL.');
 
-        // Store the token first: it is the part the user cannot easily re-enter,
-        // and it must not be lost to an unrelated settings.json problem.
-        const tokenWarning = msg.token ? await setToken(context, String(msg.token)) : null;
+        // Credentials first: they are the part you cannot easily re-enter, and they
+        // must not be lost to an unrelated settings.json problem.
+        const warnings = [];
+        if (msg.token) warnings.push(await setToken(context, String(msg.token)));
+        if (msg.cookie) warnings.push(await setCookie(context, String(msg.cookie)));
+
+        const identity = parseJson(msg.identity, 'Extra request fields');
+        const params = parseJson(msg.params, 'Model parameters');
+        await setPrivate(context, 'identity', identity);
+        await setPrivate(context, 'params', params);
 
         const authHeader = String(msg.authHeader || '').trim() || 'X-Corp-Auth';
         const authPrefix = String(msg.authPrefix ?? '');
+        const chatPath = String(msg.chatPath || '').trim() || '/chat';
+        const models = String(msg.models || '').trim();
+        const promptField = String(msg.promptField || '').trim() || 'prompt';
+        const textPath = String(msg.textPath || '').trim();
 
-        const settingsWarning = await saveSettings(context, {
+        warnings.push(await saveSettings(context, {
           url,
+          chatPath,
+          promptField,
           authHeader,
           authPrefix,
+          models,
+          textPath,
           maxResponseChars: Number(msg.maxResponseChars) || 5000,
           maxContinuations: Number(msg.maxContinuations) || 8,
-        });
+        }));
 
         const token = await getToken(context);
         if (!token) throw new Error('Enter the auth token.');
 
-        const info = await new CorpClient({ url, token, authHeader, authPrefix }).listModels();
+        const client = new CorpClient({
+          url,
+          token,
+          cookie: await getCookie(context),
+          authHeader,
+          authPrefix,
+          chatPath,
+          promptField,
+          models: models.split(',').map((s) => s.trim()).filter(Boolean),
+          textPath,
+          identity,
+          params,
+        });
+
+        // There is no discovery endpoint to ping, so the test is a real (tiny)
+        // round trip. Anything less would report success on a broken connection.
+        const message = await smokeTest(client);
         provider.refresh();
         await pushState();
 
-        const names = info.models.map((m) => `${m.alias} (${m.label})`).join(', ');
         panel.webview.postMessage({
           type: 'result',
           ok: true,
-          message: `Connected. ${info.models.length} model(s): ${names}. `
-            + `Upstream cap ${info.limits?.maxResponseChars ?? '?'} chars.`
-            + [tokenWarning, settingsWarning].filter(Boolean).map((w) => `\n\nNote: ${w}`).join(''),
+          message: message + warnings.filter(Boolean).map((w) => `\n\nNote: ${w}`).join(''),
         });
         vscode.window.showInformationMessage('Enterprise LLM connected — pick it in the chat model picker.');
       }
@@ -78,6 +125,45 @@ function openConfigPanel(context, provider) {
   });
 
   return panel;
+}
+
+/** An empty box means "no extra fields", not an error. */
+function parseJson(text, label) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(`${label} is not valid JSON: ${err.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object, e.g. {"key": "value"}.`);
+  }
+  return parsed;
+}
+
+/** One short request through the real path, so "Connected" means it. */
+async function smokeTest(client) {
+  const started = Date.now();
+  let text = '';
+  let firstFrame = '';
+
+  const stream = client.converse({
+    modelAlias: client.models[0]?.alias ?? client.models[0] ?? undefined,
+    turns: [{ speaker: 'human', utterance: 'Reply with exactly: OK' }],
+    onRawFrame: (raw) => { firstFrame = raw; },
+  });
+
+  for await (const ev of stream) {
+    if (ev.type === 'text') text += ev.text;
+    if (text.length > 400) break;
+  }
+
+  if (!text.trim()) {
+    throw new Error(`The endpoint answered but no text came back. First frame: ${firstFrame || '(none)'}`);
+  }
+  return `Connected in ${Date.now() - started}ms. The model replied: ${JSON.stringify(text.trim().slice(0, 80))}`;
 }
 
 function nonce() {
@@ -98,12 +184,18 @@ function html(webview) {
          padding: 22px 26px; max-width: 620px; }
   h2 { margin: 0 0 4px; font-size: 17px; }
   p.sub { margin: 0 0 22px; color: var(--vscode-descriptionForeground); font-size: 12.5px; }
+  h3 { margin: 26px 0 0; font-size: 12.5px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--vscode-descriptionForeground); border-top: 1px solid var(--vscode-panel-border);
+       padding-top: 16px; }
   label { display: block; margin: 16px 0 5px; font-size: 12px; font-weight: 600; }
   .hint { font-weight: 400; color: var(--vscode-descriptionForeground); }
-  input { width: 100%; padding: 7px 9px; font-family: inherit; font-size: 13px;
+  input, textarea { width: 100%; padding: 7px 9px; font-size: 13px;
           color: var(--vscode-input-foreground); background: var(--vscode-input-background);
           border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; }
-  input:focus { outline: 1px solid var(--vscode-focusBorder); }
+  input { font-family: inherit; }
+  textarea { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
+             min-height: 96px; resize: vertical; }
+  input:focus, textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   .actions { margin-top: 24px; display: flex; gap: 10px; align-items: center; }
   button { padding: 7px 15px; font-size: 13px; border: none; border-radius: 3px; cursor: pointer;
@@ -120,14 +212,23 @@ function html(webview) {
   .saved { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-top: 5px; }
 </style></head><body>
   <h2>Enterprise LLM</h2>
-  <p class="sub">Point VS Code chat at your company's chat-only LLM. The token is kept in VS Code's own storage, never in settings.json. Set <code>ellm.tokenStorage</code> to <code>keychain</code> to encrypt it, if your machine allows.</p>
+  <p class="sub">Everything specific to you or your company is typed here, never written into the extension's code. Credentials go to VS Code's own storage; the identity block stays in extension storage. Neither is ever put in settings.json.</p>
 
-  <label>Endpoint URL <span class="hint">— base URL, no path</span></label>
-  <input id="url" placeholder="http://127.0.0.1:9800" />
+  <label>Endpoint URL <span class="hint">— origin only, no path</span></label>
+  <input id="url" placeholder="https://example.com" />
+
+  <label>Chat path <span class="hint">— the streaming endpoint</span></label>
+  <input id="chatPath" placeholder="/api/…/chat" />
+
+  <h3>Credentials</h3>
 
   <label>Auth token</label>
   <input id="token" type="password" placeholder="paste token" />
   <div class="saved" id="saved"></div>
+
+  <label>Cookie <span class="hint">— optional, only if the gateway needs one</span></label>
+  <input id="cookie" type="password" placeholder="name=value; name2=value2" />
+  <div class="saved" id="savedCookie"></div>
 
   <div class="grid">
     <div>
@@ -135,8 +236,30 @@ function html(webview) {
       <input id="authHeader" placeholder="X-Corp-Auth" />
     </div>
     <div>
-      <label>Token prefix <span class="hint">— e.g. "Bearer " (keep the space)</span></label>
+      <label>Token prefix <span class="hint">— e.g. "Bearer " with the space</span></label>
       <input id="authPrefix" placeholder="(none)" />
+    </div>
+  </div>
+
+  <h3>Request</h3>
+
+  <label>Models <span class="hint">— comma separated, as the backend names them</span></label>
+  <input id="models" placeholder="model-name-1, model-name-2" />
+
+  <label>Extra request fields <span class="hint">— JSON merged into every request body</span></label>
+  <textarea id="identity" placeholder='{ "someField": "…", "nested": { … } }'></textarea>
+
+  <label>Model parameters <span class="hint">— JSON: temperature, max_tokens, anything else</span></label>
+  <textarea id="params" placeholder='{ "temperature": 0.3, "max_tokens": 4096 }'></textarea>
+
+  <div class="grid">
+    <div>
+      <label>Prompt field <span class="hint">— body key holding the prompt</span></label>
+      <input id="promptField" placeholder="prompt" />
+    </div>
+    <div>
+      <label>Text field path <span class="hint">— blank = auto-detect</span></label>
+      <input id="textPath" placeholder="(auto)" />
     </div>
   </div>
 
@@ -153,7 +276,7 @@ function html(webview) {
 
   <div class="actions">
     <button id="save">Save &amp; Test</button>
-    <button id="clear" class="secondary">Clear token</button>
+    <button id="clear" class="secondary">Clear credentials</button>
   </div>
 
   <div id="status"></div>
@@ -166,13 +289,22 @@ function html(webview) {
     const m = e.data;
     if (m.type === 'state') {
       $('url').value = m.url || '';
+      $('chatPath').value = m.chatPath || '';
       $('authHeader').value = m.authHeader || '';
       $('authPrefix').value = m.authPrefix || '';
+      $('models').value = m.models || '';
+      $('textPath').value = m.textPath || '';
+      $('promptField').value = m.promptField || '';
+      $('identity').value = m.identity === '{}' ? '' : m.identity;
+      $('params').value = m.params === '{}' ? '' : m.params;
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
       $('saved').textContent = m.tokenLocation
         ? 'Token saved in ' + m.tokenLocation + '. Leave blank to keep it.'
         : 'No token saved yet.';
+      $('savedCookie').textContent = m.hasCookie
+        ? 'A cookie is saved. Leave blank to keep it.'
+        : 'No cookie saved.';
     }
     if (m.type === 'result') {
       const s = $('status');
@@ -187,13 +319,21 @@ function html(webview) {
     vscode.postMessage({
       type: 'save',
       url: $('url').value,
+      chatPath: $('chatPath').value,
       token: $('token').value,
+      cookie: $('cookie').value,
       authHeader: $('authHeader').value,
       authPrefix: $('authPrefix').value,
+      models: $('models').value,
+      identity: $('identity').value,
+      params: $('params').value,
+      textPath: $('textPath').value,
+      promptField: $('promptField').value,
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
     });
     $('token').value = '';
+    $('cookie').value = '';
   };
   $('clear').onclick = () => vscode.postMessage({ type: 'clear' });
   vscode.postMessage({ type: 'ready' });

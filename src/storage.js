@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 
 const TOKEN_KEY = 'ellm.authToken';
+const COOKIE_KEY = 'ellm.cookie';
 
 /**
  * Where the auth token lives.
@@ -21,50 +22,71 @@ function tokenStorageMode(context) {
   return readSetting(context, 'tokenStorage', 'global');
 }
 
-async function getToken(context) {
+async function getSecret(context, key) {
   const mode = tokenStorageMode(context);
 
   if (mode === 'keychain') {
     try {
-      const secret = await context.secrets.get(TOKEN_KEY);
+      const secret = await context.secrets.get(key);
       if (secret) return secret;
     } catch {
       // Keychain unavailable - fall through to the plain stores.
     }
   }
-  // Always consult both plain stores, so switching modes never strands a token.
-  return context.workspaceState.get(TOKEN_KEY) ?? context.globalState.get(TOKEN_KEY);
+  // Always consult both plain stores, so switching modes never strands a value.
+  return context.workspaceState.get(key) ?? context.globalState.get(key);
 }
 
 /** Returns a warning string if the requested store could not be used, else null. */
-async function setToken(context, token) {
+async function setSecret(context, key, value) {
   const mode = tokenStorageMode(context);
-  await clearToken(context);
+  await clearSecret(context, key);
 
   if (mode === 'keychain') {
     try {
-      await context.secrets.store(TOKEN_KEY, token);
+      await context.secrets.store(key, value);
       return null;
     } catch (err) {
-      await context.globalState.update(TOKEN_KEY, token);
-      return `the OS keychain was unavailable (${err.message}), so the token was stored `
+      await context.globalState.update(key, value);
+      return `the OS keychain was unavailable (${err.message}), so the value was stored `
         + 'unencrypted in VS Code global storage instead.';
     }
   }
 
-  if (mode === 'workspace') await context.workspaceState.update(TOKEN_KEY, token);
-  else await context.globalState.update(TOKEN_KEY, token);
+  if (mode === 'workspace') await context.workspaceState.update(key, value);
+  else await context.globalState.update(key, value);
   return null;
 }
 
-async function clearToken(context) {
+async function clearSecret(context, key) {
   try {
-    await context.secrets.delete(TOKEN_KEY);
+    await context.secrets.delete(key);
   } catch {
     // Nothing to clear if the keychain is not reachable.
   }
-  await context.globalState.update(TOKEN_KEY, undefined);
-  await context.workspaceState.update(TOKEN_KEY, undefined);
+  await context.globalState.update(key, undefined);
+  await context.workspaceState.update(key, undefined);
+}
+
+const getToken = (context) => getSecret(context, TOKEN_KEY);
+const setToken = (context, token) => setSecret(context, TOKEN_KEY, token);
+const clearToken = (context) => clearSecret(context, TOKEN_KEY);
+
+const getCookie = (context) => getSecret(context, COOKIE_KEY);
+const setCookie = (context, cookie) => setSecret(context, COOKIE_KEY, cookie);
+
+/**
+ * Values that are private but not credentials - the identity block the backend
+ * wants, which carries a name, an email and an employee id. Kept in the
+ * extension's own storage and deliberately never written to settings.json, which
+ * is a file people paste into issues and sync between machines.
+ */
+function getPrivate(context, key, fallback) {
+  return context.globalState.get(`private.${key}`) ?? fallback;
+}
+
+async function setPrivate(context, key, value) {
+  await context.globalState.update(`private.${key}`, value);
 }
 
 /** Human-readable description of where the token currently is. */
@@ -110,5 +132,7 @@ async function saveSettings(context, values) {
 }
 
 module.exports = {
-  TOKEN_KEY, getToken, setToken, clearToken, tokenLocation, readSetting, saveSettings, tokenStorageMode,
+  TOKEN_KEY, COOKIE_KEY, getToken, setToken, clearToken, tokenLocation,
+  getSecret, setSecret, clearSecret, getCookie, setCookie,
+  getPrivate, setPrivate, readSetting, saveSettings, tokenStorageMode,
 };
