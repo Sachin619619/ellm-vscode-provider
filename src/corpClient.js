@@ -28,10 +28,49 @@ const DEFAULT_PROMPT_FIELD = 'prompt';
  * real frame is known - guessing is a fallback, not the design.
  */
 const TEXT_PATHS = [
-  'payload.deltaText', 'delta.text', 'delta.content', 'delta',
+  'completionText', 'completion_text', 'payload.deltaText', 'delta.text', 'delta.content', 'delta',
   'text', 'content', 'message', 'answer', 'completion', 'response', 'output',
-  'choices.0.delta.content', 'choices.0.text', 'data',
+  'outputText', 'generated_text', 'choices.0.delta.content', 'choices.0.text', 'data',
 ];
+
+/**
+ * Pull one complete JSON value off the front of `buf`.
+ *
+ * Streams do not always put one frame per line - plenty concatenate objects
+ * back to back, `{...}{...}`, with no separator at all. Counting braces is the
+ * only way to find the boundary, and strings have to be skipped while counting
+ * or a `{` inside a message ends the frame early.
+ *
+ * Returns {raw, rest}, or {incomplete:true} when the value is still arriving.
+ */
+function takeJson(buf) {
+  const start = buf.search(/\S/);
+  if (start === -1) return null;
+
+  const open = buf[start];
+  if (open !== '{' && open !== '[') return null;
+  const close = open === '{' ? '}' : ']';
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < buf.length; i++) {
+    const c = buf[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === open) depth++;
+    else if (c === close && --depth === 0) {
+      return { raw: buf.slice(start, i + 1), rest: buf.slice(i + 1) };
+    }
+  }
+  return { incomplete: true };
+}
 
 const FINISH_KEYS = ['stopReason', 'stop_reason', 'finishReason', 'finish_reason'];
 /** Frame-level markers that mean "the answer was cut short, ask for the rest". */
@@ -205,37 +244,98 @@ class CorpClient {
     let reportedRaw = false;
     let firstRaw = '';
 
-    const handle = (raw) => {
-      const events = [];
-      if (!raw || raw === '[DONE]' || raw === 'EOM') {
-        if (raw) finish = finish ?? 'stop';
-        return events;
-      }
-
-      // The first frame is logged verbatim: when the shape is not what this file
+    const noteRaw = (raw) => {
+      // The first frame is recorded verbatim: when the shape is not what this file
       // expects, that one line is the whole diagnosis.
-      if (!reportedRaw) {
-        reportedRaw = true;
-        firstRaw = raw.slice(0, 400);
-        if (onRawFrame) onRawFrame(firstRaw);
-      }
+      if (reportedRaw) return;
+      reportedRaw = true;
+      firstRaw = raw.slice(0, 400);
+      if (onRawFrame) onRawFrame(firstRaw);
+    };
 
+    const asText = (text) => {
+      noteRaw(text);
+      sawText = true;
+      return [{ type: 'text', text }];
+    };
+
+    const handleFrame = (raw) => {
+      noteRaw(raw);
       let frame;
       try {
         frame = JSON.parse(raw);
       } catch {
-        // Not JSON - a plain-text stream is a legitimate shape, so pass it through.
-        events.push({ type: 'text', text: raw });
+        // Balanced but not valid JSON - show it rather than swallow it.
         sawText = true;
-        return events;
+        return [{ type: 'text', text: raw }];
       }
 
-      const text = textFrom(frame, this.textPath);
-      if (text) {
-        events.push({ type: 'text', text });
-        sawText = true;
-      }
       finish = finishFrom(frame) ?? finish;
+      const text = textFrom(frame, this.textPath);
+      if (!text) return []; // an envelope or a keep-alive, carrying nothing to show
+      sawText = true;
+      return [{ type: 'text', text }];
+    };
+
+    /**
+     * Consume whatever is complete in the buffer. `final` means the stream has
+     * ended, so a partial value is all we are ever going to get and is better
+     * shown than dropped.
+     */
+    const drain = (final) => {
+      const events = [];
+
+      for (;;) {
+        buffer = buffer.replace(/^\s+/, '');
+        if (!buffer) break;
+
+        // SSE bookkeeping lines carry no payload.
+        const control = /^(?::|event:|id:|retry:)[^\n]*(\n|$)/.exec(buffer);
+        if (control) {
+          if (!control[1] && !final) break; // still arriving
+          buffer = buffer.slice(control[0].length);
+          continue;
+        }
+
+        if (buffer.startsWith('data:')) {
+          buffer = buffer.slice(5).replace(/^[ \t]*/, '');
+          continue;
+        }
+
+        // Checked before the JSON branch: "[DONE]" would otherwise look like an array.
+        const end = /^(\[DONE\]|EOM)/.exec(buffer);
+        if (end) {
+          finish = finish ?? 'stop';
+          buffer = buffer.slice(end[0].length);
+          continue;
+        }
+
+        if (buffer[0] === '{' || buffer[0] === '[') {
+          const taken = takeJson(buffer);
+          if (taken?.incomplete) {
+            if (!final) break; // wait for the rest of the object
+            events.push(...asText(buffer));
+            buffer = '';
+            break;
+          }
+          buffer = taken.rest;
+          events.push(...handleFrame(taken.raw));
+          continue;
+        }
+
+        // Plain text, which is a legitimate stream shape on its own.
+        const nl = buffer.indexOf('\n');
+        if (nl === -1) {
+          if (!final) break;
+          events.push(...asText(buffer));
+          buffer = '';
+          break;
+        }
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (line.trim()) events.push(...asText(line));
+      }
+
       return events;
     };
 
@@ -243,19 +343,9 @@ class CorpClient {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-
-      let nl;
-      while ((nl = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        if (!line || line.startsWith(':') || /^(event|id|retry):/.test(line)) continue;
-        for (const ev of handle(line.startsWith('data:') ? line.slice(5).trim() : line)) yield ev;
-      }
+      for (const ev of drain(false)) yield ev;
     }
-    if (buffer.trim()) {
-      const rest = buffer.trim();
-      for (const ev of handle(rest.startsWith('data:') ? rest.slice(5).trim() : rest)) yield ev;
-    }
+    for (const ev of drain(true)) yield ev;
 
     if (!sawText) {
       // Carry the frame in the error itself. Telling someone to go and find it in an

@@ -292,3 +292,55 @@ test('the prompt goes in whichever body field the backend names', async () => {
   assert.strictEqual(seen[0].body.question, 'Hi');
   assert.strictEqual(seen[0].body.prompt, undefined);
 });
+
+// --- streams that do not put one frame per line -----------------------------
+
+test('objects concatenated with no separator are read as separate frames', async () => {
+  const body = '{"statusCode":200,"headers":{"Content-Type":"text/event-stream"}}'
+    + '{"completionText":"Hello"}{"completionText":" there"}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.strictEqual(value.text, 'Hello there', 'the envelope must not reach the user');
+});
+
+test('an object split across chunks is held until it is complete', async () => {
+  const whole = '{"completionText":"Hello there"}';
+  for (const at of [5, 18, 25]) {
+    const res = {
+      ok: true,
+      status: 200,
+      headers: { get: () => 'text/event-stream' },
+      body: {
+        getReader() {
+          const parts = [whole.slice(0, at), whole.slice(at)];
+          let i = 0;
+          return {
+            async read() {
+              if (i >= parts.length) return { done: true };
+              return { done: false, value: new TextEncoder().encode(parts[i++]) };
+            },
+          };
+        },
+      },
+    };
+    const { value } = await withFetch(res, () => converse(client()));
+    assert.strictEqual(value.text, 'Hello there', `split at ${at}`);
+  }
+});
+
+test('braces and quotes inside the text do not end the frame early', async () => {
+  const body = '{"completionText":"use { and } and \\" here"}{"completionText":" ok"}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.strictEqual(value.text, 'use { and } and " here ok');
+});
+
+test('completionText is auto-detected', async () => {
+  const { value } = await withFetch(response({ frames: ['{"completionText":"hi"}'] }),
+    () => converse(client()));
+  assert.strictEqual(value.text, 'hi');
+});
+
+test('a frame carrying no text is skipped silently, not shown', async () => {
+  const body = '{"statusCode":200,"headers":{}}{"completionText":"only this"}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.strictEqual(value.text, 'only this');
+});
