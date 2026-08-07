@@ -96,11 +96,50 @@ Two things go wrong when stitching, both handled:
   parity tracked so a resumed code block stays one block.
 
 **3. Agent mode needs tool calling.** VS Code only offers models that advertise `toolCalling`,
-and expects structured calls back. If your backend is text-only,
-[`src/toolshim.js`](src/toolshim.js) teaches it a `<tool_call>{…}</tool_call>` protocol and
-converts what comes back into `LanguageModelToolCallPart`.
+and expects structured calls back. A plain chat endpoint has no such thing — no tool schemas
+going out, no structured calls coming back, no notion of a tool turn in the history. Without
+something in between, your model simply never appears in agent mode.
 
-Models improvise, so the scanner is forgiving about how the call actually arrives:
+### Whose tools are these?
+
+**The editor's.** This extension contributes no tools of its own — no `registerTool`, no
+`languageModelTools` contribution. Reading files, editing them, running terminal commands,
+searching the workspace, and asking you to approve any of it: all of that belongs to the chat
+client, and none of it changes. What this extension does is let a text-only model take part in
+a conversation the client is already running.
+
+```
+   chat client (agent mode)
+   owns the tools, executes them, asks for approval
+            │  options.tools  ─ read_file, edit, run_in_terminal, …
+            ▼
+   ┌────────────────────────────────────────────────────────┐
+   │  this extension                                        │
+   │                                                        │
+   │  out ─ tool schemas written into the prompt as text,   │
+   │        with the protocol to answer in:                 │
+   │        <tool_call>{"name":…,"arguments":…}</tool_call> │
+   │                                                        │
+   │  in  ─ that tag scanned back out of the streamed text  │
+   │        and rebuilt as a LanguageModelToolCallPart      │
+   └────────────────────────────────────────────────────────┘
+            │  POST {promptField: "…"}          ▲  text/event-stream
+            ▼                                   │
+   your enterprise LLM — a plain chat endpoint, none the wiser
+```
+
+The result comes back the same way in reverse: the client executes the tool and hands back a
+result, which is rendered into the next prompt as `TOOL RESULT (call_id): …`, because a chat
+endpoint has nowhere else to put it. The model reads it as conversation and continues.
+
+**This is emulation, not a native capability.** A real tool API guarantees the shape of what
+comes back; a prompt does not. Whether a given model honours the protocol is a property of that
+model, and a gateway that injects its own system prompt can compete with the instructions. The
+telling symptom is `0 tool call(s)` in the *Enterprise LLM* output channel while the model
+talks about reading a file instead of calling the tool.
+
+Which is why the scanner in [`src/toolshim.js`](src/toolshim.js) is forgiving about how the
+call actually arrives:
 
 - a tag **split across streaming chunks** is reassembled, never half-emitted
 - a **mangled closing tag** (`</tool_call}`, or none at all) is still parsed as a call rather
