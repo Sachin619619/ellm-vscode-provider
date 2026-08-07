@@ -1,8 +1,8 @@
 const vscode = require('vscode');
 const { CorpClient } = require('./corpClient');
-const { SECRET_KEY } = require('./provider');
+const { getToken, setToken, clearToken, tokenLocation, readSetting, saveSettings } = require('./storage');
 
-/** Webview where the auth token and endpoint are entered. Token goes to SecretStorage. */
+/** Webview where the auth token and endpoint are entered. See storage.js for where the token lands. */
 function openConfigPanel(context, provider) {
   const panel = vscode.window.createWebviewPanel(
     'ellmConfig',
@@ -11,17 +11,15 @@ function openConfigPanel(context, provider) {
     { enableScripts: true, retainContextWhenHidden: true },
   );
 
-  const cfg = () => vscode.workspace.getConfiguration('ellm');
   panel.webview.html = html(panel.webview);
 
   const pushState = async () => {
-    const token = await context.secrets.get(SECRET_KEY);
     panel.webview.postMessage({
       type: 'state',
-      url: cfg().get('url', ''),
-      hasToken: Boolean(token),
-      maxResponseChars: cfg().get('maxResponseChars', 5000),
-      maxContinuations: cfg().get('maxContinuations', 8),
+      url: readSetting(context, 'url', ''),
+      tokenLocation: await tokenLocation(context),
+      maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
+      maxContinuations: readSetting(context, 'maxContinuations', 8),
     });
   };
 
@@ -30,7 +28,7 @@ function openConfigPanel(context, provider) {
       if (msg.type === 'ready') return pushState();
 
       if (msg.type === 'clear') {
-        await context.secrets.delete(SECRET_KEY);
+        await clearToken(context);
         provider.refresh();
         await pushState();
         return panel.webview.postMessage({ type: 'result', ok: true, message: 'Saved token cleared.' });
@@ -40,12 +38,17 @@ function openConfigPanel(context, provider) {
         const url = String(msg.url || '').trim().replace(/\/+$/, '');
         if (!url) throw new Error('Enter the enterprise LLM URL.');
 
-        await cfg().update('url', url, vscode.ConfigurationTarget.Global);
-        await cfg().update('maxResponseChars', Number(msg.maxResponseChars) || 5000, vscode.ConfigurationTarget.Global);
-        await cfg().update('maxContinuations', Number(msg.maxContinuations) || 8, vscode.ConfigurationTarget.Global);
-        if (msg.token) await context.secrets.set(SECRET_KEY, String(msg.token));
+        // Store the token first: it is the part the user cannot easily re-enter,
+        // and it must not be lost to an unrelated settings.json problem.
+        const tokenWarning = msg.token ? await setToken(context, String(msg.token)) : null;
 
-        const token = await context.secrets.get(SECRET_KEY);
+        const settingsWarning = await saveSettings(context, {
+          url,
+          maxResponseChars: Number(msg.maxResponseChars) || 5000,
+          maxContinuations: Number(msg.maxContinuations) || 8,
+        });
+
+        const token = await getToken(context);
         if (!token) throw new Error('Enter the auth token.');
 
         const info = await new CorpClient({ url, token }).listModels();
@@ -56,7 +59,9 @@ function openConfigPanel(context, provider) {
         panel.webview.postMessage({
           type: 'result',
           ok: true,
-          message: `Connected. ${info.models.length} model(s): ${names}. Upstream cap ${info.limits?.maxResponseChars ?? '?'} chars.`,
+          message: `Connected. ${info.models.length} model(s): ${names}. `
+            + `Upstream cap ${info.limits?.maxResponseChars ?? '?'} chars.`
+            + [tokenWarning, settingsWarning].filter(Boolean).map((w) => `\n\nNote: ${w}`).join(''),
         });
         vscode.window.showInformationMessage('Enterprise LLM connected — pick it in the chat model picker.');
       }
@@ -108,7 +113,7 @@ function html(webview) {
   .saved { font-size: 11.5px; color: var(--vscode-descriptionForeground); margin-top: 5px; }
 </style></head><body>
   <h2>Enterprise LLM</h2>
-  <p class="sub">Point VS Code chat at your company's chat-only LLM. The token is kept in the OS keychain, never in settings.json.</p>
+  <p class="sub">Point VS Code chat at your company's chat-only LLM. The token is kept in VS Code's own storage, never in settings.json. Set <code>ellm.tokenStorage</code> to <code>keychain</code> to encrypt it, if your machine allows.</p>
 
   <label>Endpoint URL <span class="hint">— base URL, no path</span></label>
   <input id="url" placeholder="http://127.0.0.1:9800" />
@@ -145,7 +150,9 @@ function html(webview) {
       $('url').value = m.url || '';
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
-      $('saved').textContent = m.hasToken ? 'A token is saved in the keychain. Leave blank to keep it.' : 'No token saved yet.';
+      $('saved').textContent = m.tokenLocation
+        ? 'Token saved in ' + m.tokenLocation + '. Leave blank to keep it.'
+        : 'No token saved yet.';
     }
     if (m.type === 'result') {
       const s = $('status');

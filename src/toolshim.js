@@ -10,6 +10,17 @@
 const OPEN = '<tool_call>';
 const CLOSE = '</tool_call>';
 
+/**
+ * Models improvise. Two failures show up often enough to handle rather than
+ * hand to the user as raw markup:
+ *   - the closing tag comes back mangled ("</tool_call}", or missing entirely)
+ *   - the tags are skipped and the whole answer is the bare JSON object
+ */
+const BROKEN_CLOSE_TAIL = /\s*<\/?\s*tool_call\s*[^\s<]{0,3}\s*$/i;
+const BARE_CALL_START = /^\s*\{\s*"name"\s*:/;
+/** Past this, a held-back "{"name": ..." is prose, not a tool call. */
+const MAX_HOLD = 8192;
+
 function buildToolPrompt(tools) {
   const specs = tools.map((t) => {
     const fn = t.function ?? t;
@@ -62,6 +73,7 @@ class ToolCallScanner {
   #buf = '';
   #inCall = false;
   #seq = 0;
+  #emitted = false;
 
   push(chunk) {
     this.#buf += chunk;
@@ -69,51 +81,86 @@ class ToolCallScanner {
     const calls = [];
 
     for (;;) {
-      if (!this.#inCall) {
-        const idx = this.#buf.indexOf(OPEN);
-        if (idx === -1) {
-          const hold = partialTagTail(this.#buf, OPEN);
-          text += this.#buf.slice(0, this.#buf.length - hold);
-          this.#buf = hold ? this.#buf.slice(this.#buf.length - hold) : '';
-          break;
-        }
-        text += this.#buf.slice(0, idx);
-        this.#buf = this.#buf.slice(idx + OPEN.length);
-        this.#inCall = true;
-      } else {
+      if (this.#inCall) {
         const idx = this.#buf.indexOf(CLOSE);
-        if (idx === -1) break; // wait for the rest of the call
+        if (idx === -1) break; // wait for the rest of the call, or for flush()
         const raw = this.#buf.slice(0, idx);
         this.#buf = this.#buf.slice(idx + CLOSE.length);
         this.#inCall = false;
 
-        try {
-          const parsed = JSON.parse(raw.trim());
-          calls.push({
-            index: this.#seq,
-            id: `call_${Date.now()}_${this.#seq++}`,
-            type: 'function',
-            function: {
-              name: parsed.name,
-              arguments: JSON.stringify(parsed.arguments ?? parsed.parameters ?? {}),
-            },
-          });
-        } catch {
-          // Malformed call - surface it as text so the model can self-correct.
-          text += `${OPEN}${raw}${CLOSE}`;
-        }
+        const call = this.#toCall(raw);
+        if (call) calls.push(call);
+        // Malformed call - surface it as text so the model can self-correct.
+        else text += `${OPEN}${raw}${CLOSE}`;
+        continue;
       }
+
+      const idx = this.#buf.indexOf(OPEN);
+      if (idx !== -1) {
+        text += this.#buf.slice(0, idx);
+        this.#buf = this.#buf.slice(idx + OPEN.length);
+        this.#inCall = true;
+        continue;
+      }
+
+      // An answer that opens with `{"name":` is almost certainly a tool call the
+      // model forgot to tag. Hold it back instead of streaming half an object out
+      // as prose - once it parses it becomes a call, and if it never does, flush()
+      // releases it as the text it turned out to be.
+      if (!this.#emitted && !text && this.#buf.length <= MAX_HOLD && BARE_CALL_START.test(this.#buf)) {
+        const call = this.#toCall(this.#buf);
+        if (!call) break;
+        calls.push(call);
+        this.#buf = '';
+        continue;
+      }
+
+      const hold = partialTagTail(this.#buf, OPEN);
+      text += this.#buf.slice(0, this.#buf.length - hold);
+      this.#buf = hold ? this.#buf.slice(this.#buf.length - hold) : '';
+      break;
     }
 
+    if (text) this.#emitted = true;
     return { text, calls };
   }
 
-  /** Anything still buffered at end of stream is plain text. */
+  /**
+   * End of stream, so whatever is still buffered has to be decided now: a call the
+   * model closed badly - or never closed - is salvaged, anything else is text.
+   */
   flush() {
-    const rest = this.#inCall ? OPEN + this.#buf : this.#buf;
+    const buf = this.#buf;
+    const inCall = this.#inCall;
     this.#buf = '';
     this.#inCall = false;
-    return rest;
+    this.#emitted = true;
+    if (!buf) return { text: '', calls: [] };
+
+    const call = this.#toCall(inCall ? buf.replace(BROKEN_CLOSE_TAIL, '') : buf);
+    if (call) return { text: '', calls: [call] };
+    return { text: inCall ? OPEN + buf : buf, calls: [] };
+  }
+
+  /** A tool call from raw JSON, or null if it is not one. */
+  #toCall(raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw.trim());
+    } catch {
+      return null;
+    }
+    if (!parsed || typeof parsed.name !== 'string') return null;
+
+    return {
+      index: this.#seq,
+      id: `call_${Date.now()}_${this.#seq++}`,
+      type: 'function',
+      function: {
+        name: parsed.name,
+        arguments: JSON.stringify(parsed.arguments ?? parsed.parameters ?? {}),
+      },
+    };
   }
 }
 

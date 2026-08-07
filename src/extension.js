@@ -1,5 +1,6 @@
 const vscode = require('vscode');
-const { EllmChatProvider, SECRET_KEY } = require('./provider');
+const { EllmChatProvider } = require('./provider');
+const { getToken, setToken, clearToken, readSetting, saveSettings } = require('./storage');
 const { openConfigPanel } = require('./configPanel');
 
 let output;
@@ -16,9 +17,8 @@ async function activate(context) {
   const underTest = context.extensionMode === vscode.ExtensionMode.Test
     || context.extensionMode === vscode.ExtensionMode.Development;
   if (underTest && process.env.ELLM_TEST_URL && process.env.ELLM_TEST_TOKEN) {
-    await vscode.workspace.getConfiguration('ellm')
-      .update('url', process.env.ELLM_TEST_URL, vscode.ConfigurationTarget.Global);
-    await context.secrets.store(SECRET_KEY, process.env.ELLM_TEST_TOKEN);
+    await saveSettings(context, { url: process.env.ELLM_TEST_URL });
+    await setToken(context, process.env.ELLM_TEST_TOKEN);
     output.appendLine(`seeded connection from env: ${process.env.ELLM_TEST_URL}`);
   }
 
@@ -29,7 +29,7 @@ async function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand('ellm.configure', () => openConfigPanel(context, provider)),
     vscode.commands.registerCommand('ellm.signOut', async () => {
-      await context.secrets.delete(SECRET_KEY);
+      await clearToken(context);
       provider.refresh();
       vscode.window.showInformationMessage('Enterprise LLM token cleared.');
     }),
@@ -37,7 +37,9 @@ async function activate(context) {
   );
 
   await promptIfUnconfigured(context, provider);
-  return { provider };
+  // The extension context is handed out only under test, so the E2E suite can
+  // exercise the storage layer against a real ExtensionContext instead of a stub.
+  return underTest ? { provider, context } : { provider };
 }
 
 /**
@@ -46,8 +48,8 @@ async function activate(context) {
  * Say so once, then never again.
  */
 async function promptIfUnconfigured(context, provider) {
-  const url = vscode.workspace.getConfiguration('ellm').get('url');
-  const token = await context.secrets.get(SECRET_KEY);
+  const url = readSetting(context, 'url', '');
+  const token = await getToken(context);
   if (url && token) return;
 
   if (context.globalState.get('ellm.welcomed')) {

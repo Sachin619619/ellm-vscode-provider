@@ -23,15 +23,33 @@ so your models appear in the normal model picker next to everything else.
 Grab the `.vsix` from [Releases](../../releases) and:
 
 ```bash
-code --install-extension ellm-provider-0.1.0.vsix
+code --install-extension ellm-provider-0.1.2.vsix
 ```
+
+Requires VS Code 1.104 or newer.
 
 Then **Cmd/Ctrl+Shift+P → “Enterprise LLM: Configure Connection”**, enter your endpoint URL
 and auth token, press **Save & Test**. The models show up in the chat model picker.
 
-Your token is stored in the OS keychain via VS Code's `SecretStorage` — never in
-`settings.json`, never written to disk in plaintext, never sent anywhere except the endpoint
-you configure.
+## Where your token goes
+
+Never into `settings.json`, never anywhere but the endpoint you configure. Which store it
+lands in is up to `ellm.tokenStorage`:
+
+| `ellm.tokenStorage` | Where | Encrypted |
+|---|---|---|
+| `global` (default) | VS Code global storage — this machine, every folder | no |
+| `workspace` | VS Code workspace storage — this folder only | no |
+| `keychain` | OS keychain via `SecretStorage` | yes |
+
+The keychain is the only encrypted option, but it is deliberately **not** the default: managed
+corporate machines can refuse `SecretStorage` outright, and a token that silently fails to save
+is worse than one saved in the clear. Pick `keychain` if your machine allows it — if the write
+is refused the token falls back to global storage and the panel tells you so.
+
+For the same reason, a `settings.json` that VS Code will not write — a stray comma somewhere
+unrelated is enough — no longer blocks configuration. The endpoint and limits fall back to the
+extension's own storage, and everything keeps working.
 
 ## The three problems it solves
 
@@ -59,8 +77,15 @@ Two things go wrong when stitching, both handled:
 **3. Agent mode needs tool calling.** VS Code only offers models that advertise `toolCalling`,
 and expects structured calls back. If your backend is text-only,
 [`src/toolshim.js`](src/toolshim.js) teaches it a `<tool_call>{…}</tool_call>` protocol and
-converts what comes back into `LanguageModelToolCallPart`, including reassembly when a tag is
-split across streaming chunks.
+converts what comes back into `LanguageModelToolCallPart`.
+
+Models improvise, so the scanner is forgiving about how the call actually arrives:
+
+- a tag **split across streaming chunks** is reassembled, never half-emitted
+- a **mangled closing tag** (`</tool_call}`, or none at all) is still parsed as a call rather
+  than dumped on the user as raw markup
+- a **bare, untagged** `{"name": …, "arguments": …}` answer is recognised as the call it is
+- genuinely malformed JSON inside the tags *is* shown as text, so the model can self-correct
 
 ## Adapting it to your LLM
 
@@ -91,12 +116,23 @@ Point the extension at `http://127.0.0.1:9800` with that token.
 
 ```bash
 npm install
-node test/runTest.js      # launches real VS Code and drives the genuine vscode.lm API
+npm test                  # fast, deterministic: the tool-call scanner
+npm run test:e2e          # launches real VS Code and drives the genuine vscode.lm API
 ```
 
-The suite verifies model discovery, an answer longer than the upstream cap arriving intact
+The E2E suite verifies model discovery, an answer longer than the upstream cap arriving intact
 with no duplicated lines across the seam, a tool call surfacing as a `LanguageModelToolCallPart`,
-and a full tool-result round trip.
+a full tool-result round trip, and that the token survives without the OS keychain. It needs
+`test-server/` running, and takes its connection from the environment:
+
+```bash
+ELLM_TEST_URL=http://127.0.0.1:9800 ELLM_TEST_TOKEN=$(cat test-server/.token) \
+ELLM_TEST_WORKSPACE=/path/to/some/repo npm run test:e2e
+```
+
+It runs in a throwaway VS Code profile, so it never touches your real settings or tokens.
+What a model chooses to emit varies run to run, so the awkward shapes are pinned in the
+deterministic suite rather than left to the live one.
 
 ## Limits worth knowing
 

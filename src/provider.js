@@ -2,8 +2,7 @@ const vscode = require('vscode');
 const { CorpClient, CorpAuthError } = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const { buildToolPrompt, ToolCallScanner } = require('./toolshim');
-
-const SECRET_KEY = 'ellm.authToken';
+const { getToken, readSetting } = require('./storage');
 
 /** Read a VS Code message part without depending on class identity across API versions. */
 function partToPieces(part) {
@@ -39,9 +38,10 @@ class EllmChatProvider {
   }
 
   async client() {
-    const cfg = vscode.workspace.getConfiguration('ellm');
-    const token = await this.context.secrets.get(SECRET_KEY);
-    return new CorpClient({ url: cfg.get('url'), token });
+    return new CorpClient({
+      url: readSetting(this.context, 'url', ''),
+      token: await getToken(this.context),
+    });
   }
 
   // --- 1. which models this provider offers ---------------------------------
@@ -95,7 +95,6 @@ class EllmChatProvider {
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());
 
-    const cfg = vscode.workspace.getConfiguration('ellm');
     const scanner = shimming ? new ToolCallScanner() : null;
     const started = Date.now();
     let chars = 0;
@@ -109,43 +108,41 @@ class EllmChatProvider {
       });
 
       const stream = withContinuation(rounds, turns, {
-        maxResponseChars: cfg.get('maxResponseChars', 5000),
-        maxContinuations: cfg.get('maxContinuations', 8),
+        maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
+        maxContinuations: readSetting(this.context, 'maxContinuations', 8),
         signal: controller.signal,
         log: (m) => this.log(m),
       });
+
+      const emit = ({ text, calls: found }) => {
+        if (text) {
+          chars += text.length;
+          progress.report(new vscode.LanguageModelTextPart(text));
+        }
+        for (const c of found) {
+          calls++;
+          progress.report(new vscode.LanguageModelToolCallPart(
+            c.id,
+            c.function.name,
+            JSON.parse(c.function.arguments || '{}'),
+          ));
+        }
+      };
 
       for await (const ev of stream) {
         if (token.isCancellationRequested) break;
         if (ev.type !== 'text' || !ev.text) continue;
 
         if (scanner) {
-          const { text, calls: found } = scanner.push(ev.text);
-          if (text) {
-            chars += text.length;
-            progress.report(new vscode.LanguageModelTextPart(text));
-          }
-          for (const c of found) {
-            calls++;
-            progress.report(new vscode.LanguageModelToolCallPart(
-              c.id,
-              c.function.name,
-              JSON.parse(c.function.arguments || '{}'),
-            ));
-          }
+          emit(scanner.push(ev.text));
         } else {
           chars += ev.text.length;
           progress.report(new vscode.LanguageModelTextPart(ev.text));
         }
       }
 
-      if (scanner) {
-        const rest = scanner.flush();
-        if (rest) {
-          chars += rest.length;
-          progress.report(new vscode.LanguageModelTextPart(rest));
-        }
-      }
+      // Whatever the scanner is still holding - an untagged or badly closed call.
+      if (scanner) emit(scanner.flush());
 
       this.log(`response complete: ${chars} chars, ${calls} tool call(s), ${Date.now() - started}ms`);
     } catch (err) {
@@ -207,4 +204,4 @@ class EllmChatProvider {
   }
 }
 
-module.exports = { EllmChatProvider, SECRET_KEY };
+module.exports = { EllmChatProvider };

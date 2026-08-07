@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -55,9 +55,28 @@
           "type": "number",
           "default": 8,
           "description": "Safety limit on how many times one answer may be continued."
+        },
+        "ellm.tokenStorage": {
+          "type": "string",
+          "enum": [
+            "global",
+            "workspace",
+            "keychain"
+          ],
+          "default": "global",
+          "enumDescriptions": [
+            "VS Code global storage — this machine, all folders. Not encrypted.",
+            "VS Code workspace storage — this folder only. Not encrypted.",
+            "OS keychain via SecretStorage. Encrypted, but unavailable on some managed machines."
+          ],
+          "markdownDescription": "Where the auth token is stored. `keychain` is the only encrypted option, but locked-down machines may refuse it — in that case the token falls back to global storage and the panel tells you."
         }
       }
     }
+  },
+  "scripts": {
+    "test": "node --test test/toolshim.test.js",
+    "test:e2e": "node test/runTest.js"
   },
   "devDependencies": {
     "@vscode/test-electron": "^3.1.0"

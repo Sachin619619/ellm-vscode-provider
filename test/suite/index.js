@@ -4,6 +4,7 @@
  */
 const vscode = require('vscode');
 const fs = require('fs');
+const storage = require('../../src/storage');
 
 const results = [];
 function check(name, pass, detail = '') {
@@ -124,12 +125,78 @@ async function run() {
 
       check('model answers from the tool result', followUp.text.trim().length > 0,
         JSON.stringify(followUp.text.slice(0, 120)));
+      // Models close the tag badly ("</tool_call}") often enough that this leaked
+      // raw markup into agent answers before the scanner learned to salvage it.
+      check('no raw tool tag leaks into the answer after a tool result',
+        !/<\/?\s*tool_call/i.test(followUp.text), JSON.stringify(followUp.text.slice(0, 120)));
     }
+
+    // --- 5. token storage without the OS keychain --------------------------
+    const context = ext?.exports?.context;
+    check('extension exposes its context under test', Boolean(context));
+    if (context) await checkStorage(context);
   } catch (err) {
     check('suite ran without throwing', false, `${err.message}\n${err.stack ?? ''}`);
   }
 
   return report(started);
+}
+
+/**
+ * A managed machine can refuse SecretStorage outright, so the token has to land
+ * somewhere plain and still be readable — and a settings.json the extension cannot
+ * write must not take the whole save down with it. Run against the real
+ * ExtensionContext rather than a stub, since that is where the refusals happen.
+ */
+async function checkStorage(context) {
+  const cfg = () => vscode.workspace.getConfiguration('ellm');
+  const originalMode = cfg().get('tokenStorage', 'global');
+  const originalToken = await storage.getToken(context);
+  const probe = `probe-token-${Date.now()}`;
+
+  const inKeychain = async () => {
+    try {
+      return await context.secrets.get(storage.TOKEN_KEY);
+    } catch {
+      return undefined; // keychain refused — exactly the case this all exists for
+    }
+  };
+
+  try {
+    await cfg().update('tokenStorage', 'global', vscode.ConfigurationTarget.Global);
+    await storage.setToken(context, probe);
+    check('token round trips in the default (non-keychain) store',
+      (await storage.getToken(context)) === probe);
+    check('default store never touches SecretStorage', (await inKeychain()) === undefined);
+    check('default store is VS Code global storage',
+      context.globalState.get(storage.TOKEN_KEY) === probe);
+    check('the panel can say where the token lives',
+      (await storage.tokenLocation(context)) === 'global storage (this machine, unencrypted)',
+      String(await storage.tokenLocation(context)));
+
+    await cfg().update('tokenStorage', 'workspace', vscode.ConfigurationTarget.Global);
+    await storage.setToken(context, `${probe}-ws`);
+    check('workspace mode writes to workspace storage',
+      context.workspaceState.get(storage.TOKEN_KEY) === `${probe}-ws`);
+    check('changing mode leaves no copy in the old store',
+      context.globalState.get(storage.TOKEN_KEY) === undefined);
+    check('getToken finds the token in either plain store',
+      (await storage.getToken(context)) === `${probe}-ws`);
+
+    await context.globalState.update('fallback.maxContinuations', 3);
+    check('an unwritable settings.json falls back to extension storage',
+      storage.readSetting(context, 'maxContinuations', 8) === 3);
+    await context.globalState.update('fallback.maxContinuations', undefined);
+    check('clearing the fallback hands the setting back to settings.json',
+      storage.readSetting(context, 'maxContinuations', 8) === 8);
+
+    await storage.clearToken(context);
+    check('clearing the token empties every store',
+      (await storage.getToken(context)) === undefined && (await storage.tokenLocation(context)) === null);
+  } finally {
+    await cfg().update('tokenStorage', originalMode, vscode.ConfigurationTarget.Global);
+    if (originalToken) await storage.setToken(context, originalToken);
+  }
 }
 
 function report(started) {
