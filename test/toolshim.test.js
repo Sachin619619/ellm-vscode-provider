@@ -162,6 +162,61 @@ test('a call missing a name is not treated as a call', () => {
   assert.match(text, /arguments/);
 });
 
+// --- a file body inside a JSON string ---------------------------------------
+//
+// Asking a model to put a source file in a JSON string gets a source file back,
+// quotes and all. These are the shapes that used to make the whole call render
+// as markup in the chat while the file was never written and nothing said so.
+
+test('a call carrying a Python docstring is still a call', () => {
+  const raw = String.raw`<tool_call>{"name":"create_file","arguments":{"filePath":"docs/gen.py","content":"""Generate a deck.\n\nRun: python gen.py\n"""\n\nimport os\n"}}</tool_call>`;
+  const { text, calls } = scan(raw);
+
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(text, ''); // never leaks into the chat as markup
+  assert.strictEqual(calls[0].function.name, 'create_file');
+  const args = JSON.parse(calls[0].function.arguments);
+  // One quote is gone for good and no parser can get it back: of the `"""` the
+  // model wrote, the first had to be the quote that opens the JSON string. What
+  // matters is that the call runs at all - a file needing one fix beats a call
+  // rendered as markup that wrote nothing and told nobody.
+  assert.ok(args.content.startsWith('""Generate a deck.'), args.content.slice(0, 20));
+  assert.match(args.content, /import os/); // the body after the docstring survives
+});
+
+test('quotes inside the file body do not truncate it', () => {
+  // `"alpha",` looks exactly like the end of a string until you try to read
+  // what follows it and find no key and no colon.
+  const raw = String.raw`<tool_call>{"name":"create_file","arguments":{"path":"a.py","content":"rows = [[\"one\", \"two\"], [\"three\"]]\nfont = \"Segoe UI\"\n"}}</tool_call>`
+    .replace(/\\"/g, '"'); // strip the escaping the model failed to add
+  const { calls } = scan(raw);
+
+  assert.strictEqual(calls.length, 1);
+  const args = JSON.parse(calls[0].function.arguments);
+  assert.match(args.content, /rows = \[\["one", "two"\], \["three"\]\]/);
+  assert.match(args.content, /font = "Segoe UI"/);
+});
+
+test('a Windows path and unescaped quotes survive together', () => {
+  const raw = String.raw`<tool_call>{"name":"create_file","arguments":{"filePath":"C:\Users\dev\gen.py","content":"x = "hi"\n"}}</tool_call>`;
+  const { calls } = scan(raw);
+
+  assert.strictEqual(calls.length, 1);
+  const args = JSON.parse(calls[0].function.arguments);
+  assert.strictEqual(args.filePath, 'C:\\Users\\dev\\gen.py');
+  assert.strictEqual(args.content, 'x = "hi"\n');
+});
+
+test('genuine prose is still not mistaken for a tool call', () => {
+  const { text, calls } = scan('Here is what I would do: {"name": not json at all');
+  assert.strictEqual(calls.length, 0);
+  assert.match(text, /Here is what I would do/);
+});
+
+test('the tool prompt says how to escape a quote', () => {
+  assert.match(buildToolPrompt([{ name: 'x' }]), /\\"/);
+});
+
 test('the tool prompt lists every tool by name', () => {
   const prompt = buildToolPrompt([
     { name: 'read_file', description: 'read it', parameters: { type: 'object' } },

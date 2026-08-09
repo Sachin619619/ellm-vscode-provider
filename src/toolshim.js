@@ -42,6 +42,11 @@ function buildToolPrompt(tools) {
     '',
     'Rules:',
     '- Arguments must be valid JSON matching the schema. No comments, no trailing commas.',
+    // The single most common way a file-writing call arrives broken: the file body
+    // goes in verbatim, quotes and all, and the whole call stops being JSON.
+    '- Inside a JSON string, write a double quote as \\" and a backslash as \\\\. '
+    + 'This applies to file contents too: a Python """docstring""", a Windows path, '
+    + 'or code containing quotes must all be escaped.',
     '- Emit one tool call at a time, then stop and wait for the result.',
     '- Never wrap the tool call in markdown or code fences.',
     '- If no tool is needed, just answer normally in plain text.',
