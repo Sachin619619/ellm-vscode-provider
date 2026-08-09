@@ -292,6 +292,14 @@ function modelFieldConflicts({ extra, modelField, models = [] } = {}) {
 const SECRET_KEY_HINT = /token|secret|password|auth|cookie|apikey|api_key|credential|session/i;
 
 /**
+ * Token *limits*, which are configuration and not credentials. `max_tokens`
+ * contains "token" and was being hidden as if it were one - which buries a
+ * number worth seeing and makes the output look like it is hiding more than it
+ * is. Credentials are also always strings, so a number is never masked either.
+ */
+const TOKEN_LIMIT_KEY = /^(max|min|num|n|total|input|output|prompt|completion)[_-]?tokens?$/i;
+
+/**
  * The request as text, for reading beside the web app's payload in DevTools.
  *
  * Two things are held back even though this is the machine that owns them: the
@@ -302,14 +310,13 @@ const SECRET_KEY_HINT = /token|secret|password|auth|cookie|apikey|api_key|creden
  */
 function describeRequest({ url, body, headers, promptField }, { values = true } = {}) {
   const mask = (key, value) => {
-    if (SECRET_KEY_HINT.test(key)) {
-      const len = String(value ?? '').length;
-      return `<${len} chars, hidden>`;
-    }
     if (key === promptField) {
       const len = String(value ?? '').length;
       return `<prompt, ${len} chars, hidden>`;
     }
+    if (typeof value !== 'string') return value; // a credential is never a number
+    if (TOKEN_LIMIT_KEY.test(key)) return value;
+    if (SECRET_KEY_HINT.test(key)) return `<${value.length} chars, hidden>`;
     return value;
   };
 

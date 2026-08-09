@@ -241,6 +241,20 @@ test('key mode shows the shape without any configured values', () => {
   assert.doesNotMatch(shown, /example\.net/);
 });
 
+test('a token limit is a number, not a credential, and stays visible', () => {
+  // `max_tokens` contains "token". Hiding it buries a value worth reading and
+  // makes the output look like it is withholding more than it is.
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: {},
+    body: { max_tokens: 4096, maxTokens: '8192', authToken: 'abcdefgh' },
+    promptField: 'prompt',
+  });
+  assert.match(shown, /"max_tokens": 4096/);
+  assert.match(shown, /"maxTokens": "8192"/);
+  assert.match(shown, /"authToken": "<8 chars, hidden>"/);
+});
+
 test('a credential nested inside the identity block is masked too', () => {
   const shown = describeRequest({
     url: 'https://llm.example.com/chat',

@@ -35,6 +35,8 @@ function openConfigPanel(context, provider) {
       authPrefix: readSetting(context, 'authPrefix', ''),
       models: readSetting(context, 'models', ''),
       textPath: readSetting(context, 'textPath', ''),
+      servedModelPath: readSetting(context, 'servedModelPath', ''),
+      logRequestBody: readSetting(context, 'logRequestBody', 'off'),
       identity: JSON.stringify(getPrivate(context, 'identity', {}), null, 2),
       params: JSON.stringify(getPrivate(context, 'params', {}), null, 2),
       maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
@@ -78,6 +80,9 @@ function openConfigPanel(context, provider) {
         const promptField = String(msg.promptField || '').trim() || 'prompt';
         const modelField = String(msg.modelField || '').trim() || 'model';
         const textPath = String(msg.textPath || '').trim();
+        const servedModelPath = String(msg.servedModelPath || '').trim();
+        const logRequestBody = ['off', 'keys', 'full'].includes(msg.logRequestBody)
+          ? msg.logRequestBody : 'off';
 
         warnings.push(await saveSettings(context, {
           url,
@@ -88,6 +93,8 @@ function openConfigPanel(context, provider) {
           authPrefix,
           models,
           textPath,
+          servedModelPath,
+          logRequestBody,
           maxResponseChars: Number(msg.maxResponseChars) || 5000,
           maxContinuations: Number(msg.maxContinuations) || 8,
         }));
@@ -106,7 +113,7 @@ function openConfigPanel(context, provider) {
           modelField,
           models: models.split(',').map((s) => s.trim()).filter(Boolean),
           textPath,
-          servedModelPath: readSetting(context, 'servedModelPath', ''),
+          servedModelPath,
           identity,
           params,
         });
@@ -245,7 +252,7 @@ function html(webview) {
        padding-top: 16px; }
   label { display: block; margin: 16px 0 5px; font-size: 12px; font-weight: 600; }
   .hint { font-weight: 400; color: var(--vscode-descriptionForeground); }
-  input, textarea { width: 100%; padding: 7px 9px; font-size: 13px;
+  input, textarea, select { width: 100%; padding: 7px 9px; font-size: 13px;
           color: var(--vscode-input-foreground); background: var(--vscode-input-background);
           border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; }
   input { font-family: inherit; }
@@ -325,6 +332,21 @@ function html(webview) {
 
   <div class="grid">
     <div>
+      <label>Served model path <span class="hint">— where the reply names its model</span></label>
+      <input id="servedModelPath" placeholder="(auto)" />
+    </div>
+    <div>
+      <label>Log request payload <span class="hint">— to the output channel</span></label>
+      <select id="logRequestBody">
+        <option value="off">off — model field only</option>
+        <option value="keys">keys — shape, no values</option>
+        <option value="full">full — values too</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div>
       <label>Response char cap</label>
       <input id="maxResponseChars" type="number" min="0" />
     </div>
@@ -354,6 +376,8 @@ function html(webview) {
       $('authPrefix').value = m.authPrefix || '';
       $('models').value = m.models || '';
       $('textPath').value = m.textPath || '';
+      $('servedModelPath').value = m.servedModelPath || '';
+      $('logRequestBody').value = m.logRequestBody || 'off';
       $('promptField').value = m.promptField || '';
       $('modelField').value = m.modelField || '';
       $('identity').value = m.identity === '{}' ? '' : m.identity;
@@ -389,6 +413,8 @@ function html(webview) {
       identity: $('identity').value,
       params: $('params').value,
       textPath: $('textPath').value,
+      servedModelPath: $('servedModelPath').value,
+      logRequestBody: $('logRequestBody').value,
       promptField: $('promptField').value,
       modelField: $('modelField').value,
       maxResponseChars: $('maxResponseChars').value,

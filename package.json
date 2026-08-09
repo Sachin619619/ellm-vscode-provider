@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
