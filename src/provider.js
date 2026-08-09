@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { CorpClient, CorpAuthError } = require('./corpClient');
+const { CorpClient, CorpAuthError, describeConflict } = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const { buildToolPrompt, ToolCallScanner } = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
@@ -30,6 +30,7 @@ class EllmChatProvider {
     // Mismatches repeat on every request of a session; warn on each distinct
     // pair once so a wrong model is visible without becoming noise.
     this.warnedModels = new Set();
+    this.warnedConflicts = new Set();
   }
 
   refresh() {
@@ -49,6 +50,7 @@ class EllmChatProvider {
       authPrefix: readSetting(this.context, 'authPrefix', ''),
       chatPath: readSetting(this.context, 'chatPath', '/chat'),
       promptField: readSetting(this.context, 'promptField', 'prompt'),
+      modelField: readSetting(this.context, 'modelField', 'model'),
       models: String(readSetting(this.context, 'models', ''))
         .split(',').map((s) => s.trim()).filter(Boolean),
       textPath: readSetting(this.context, 'textPath', ''),
@@ -125,6 +127,10 @@ class EllmChatProvider {
         // is the difference between a five-minute fix and an afternoon.
         onRawFrame: (raw) => this.log(`first raw frame: ${raw}`),
         onServedModel: (served) => this.reportServedModel(served),
+        // What the request says about the model, logged before it is sent. When
+        // the picker appears to do nothing, this line and the DevTools capture
+        // side by side are the whole diagnosis.
+        onRequest: (shape) => this.reportRequestShape(shape),
         // A frame the reader could not read is never shown in the chat, so the
         // log is the only place it exists. Without this line a recovered or
         // dropped frame would be invisible.
@@ -187,7 +193,16 @@ class EllmChatProvider {
    * backend falls back to. Say so out loud rather than letting a silent
    * substitution pass for a working configuration.
    */
-  reportServedModel({ requested, served, matches }) {
+  reportServedModel({ requested, served, matches, confirmed }) {
+    if (confirmed === false) {
+      // Unverifiable is not the same as correct, and it is the state a silent
+      // substitution hides in - so it gets its own line rather than nothing.
+      this.log(
+        `served model UNCONFIRMED: no frame named a model, so "${requested}" could not be `
+        + 'verified. Set "Served model path" if the backend names it somewhere this reader misses.',
+      );
+      return;
+    }
     if (matches) {
       this.log(`served by: ${served}`);
       return;
@@ -202,6 +217,37 @@ class EllmChatProvider {
       `Enterprise LLM answered as "${served}", not the "${requested}" you picked. `
       + 'The backend does not recognise that name and substituted its default - '
       + 'check the model list in the connection panel.',
+      'Configure',
+    ).then((pick) => pick === 'Configure' && vscode.commands.executeCommand('ellm.configure'));
+  }
+
+  /**
+   * The picked model only reaches the backend if it is sent under the key the
+   * backend reads. Nothing in the response can prove it was - a backend that
+   * ignores an unknown field answers perfectly well from its default - so the
+   * request side is stated out loud, and a fixed model sitting in the extra
+   * fields is called out as the thing that would override the picker.
+   */
+  reportRequestShape({ modelField, model, conflicts }) {
+    this.log(`requesting model "${model}" in body field "${modelField}"`);
+    if (!conflicts.length) return;
+
+    for (const conflict of conflicts) {
+      this.log(`model field conflict: ${describeConflict(conflict, modelField)}`);
+    }
+
+    const serious = conflicts.filter((c) => c.reason !== 'overridden');
+    if (!serious.length) return;
+
+    const pair = `${modelField}|${serious.map((c) => c.path).join(',')}`;
+    if (this.warnedConflicts.has(pair)) return;
+    this.warnedConflicts.add(pair);
+
+    vscode.window.showWarningMessage(
+      `Enterprise LLM: the picked model is sent in "${modelField}", but `
+      + `${serious.map((c) => `"${c.path}"`).join(' and ')} in your extra request fields also `
+      + 'names a model and never changes. If the backend reads that one, the model picker has '
+      + 'no effect. Check the output channel.',
       'Configure',
     ).then((pick) => pick === 'Configure' && vscode.commands.executeCommand('ellm.configure'));
   }

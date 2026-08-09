@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { CorpClient } = require('./corpClient');
+const { CorpClient, describeConflict } = require('./corpClient');
 const {
   getToken, setToken, clearToken, tokenLocation, getCookie, setCookie,
   getPrivate, setPrivate, readSetting, saveSettings, COOKIE_KEY, clearSecret,
@@ -28,6 +28,7 @@ function openConfigPanel(context, provider) {
       url: readSetting(context, 'url', ''),
       chatPath: readSetting(context, 'chatPath', '/chat'),
       promptField: readSetting(context, 'promptField', 'prompt'),
+      modelField: readSetting(context, 'modelField', 'model'),
       tokenLocation: await tokenLocation(context),
       hasCookie: Boolean(await getCookie(context)),
       authHeader: readSetting(context, 'authHeader', 'X-Corp-Auth'),
@@ -75,12 +76,14 @@ function openConfigPanel(context, provider) {
         const chatPath = String(msg.chatPath || '').trim() || '/chat';
         const models = String(msg.models || '').trim();
         const promptField = String(msg.promptField || '').trim() || 'prompt';
+        const modelField = String(msg.modelField || '').trim() || 'model';
         const textPath = String(msg.textPath || '').trim();
 
         warnings.push(await saveSettings(context, {
           url,
           chatPath,
           promptField,
+          modelField,
           authHeader,
           authPrefix,
           models,
@@ -100,6 +103,7 @@ function openConfigPanel(context, provider) {
           authPrefix,
           chatPath,
           promptField,
+          modelField,
           models: models.split(',').map((s) => s.trim()).filter(Boolean),
           textPath,
           servedModelPath: readSetting(context, 'servedModelPath', ''),
@@ -150,6 +154,7 @@ async function smokeTest(client) {
   let text = '';
   let firstFrame = '';
   let servedModel = null;
+  let shape = null;
   const problems = [];
 
   const stream = client.converse({
@@ -157,6 +162,7 @@ async function smokeTest(client) {
     turns: [{ speaker: 'human', utterance: 'Reply with exactly: OK' }],
     onRawFrame: (raw) => { firstFrame = raw; },
     onServedModel: (served) => { servedModel = served; },
+    onRequest: (s) => { shape = s; },
     onFrameProblem: (msg) => problems.push(msg),
   });
 
@@ -170,14 +176,30 @@ async function smokeTest(client) {
   }
 
   let note = '';
-  if (servedModel && !servedModel.matches) {
+  if (shape) {
+    note += `\n\nAsked for "${shape.model}" in body field "${shape.modelField}".`;
+    if (shape.conflicts.length) {
+      // The panel is where this belongs: it is the one place that can see both the
+      // model list and the pasted extra fields at the same time, which is the only
+      // way to notice that two different fields are both choosing a model.
+      note += `\n\nMODEL FIELD CONFLICT\n${shape.conflicts
+        .map((c) => `- ${describeConflict(c, shape.modelField)}`)
+        .join('\n')}`;
+    }
+  }
+
+  if (servedModel && servedModel.confirmed === false) {
+    note += '\n\nSERVED MODEL UNCONFIRMED: the reply never named the model that produced it, so '
+      + 'there is no way to tell from here whether the model you picked was the one used. If the '
+      + 'backend names it somewhere, set "Served model path" to that key.';
+  } else if (servedModel && !servedModel.matches) {
     // A wrong model name still answers, so this is the only place the
     // substitution is visible before it silently shapes every later reply.
-    note = `\n\nMODEL MISMATCH: you asked for "${servedModel.requested}" but the reply came `
+    note += `\n\nMODEL MISMATCH: you asked for "${servedModel.requested}" but the reply came `
       + `from "${servedModel.served}". The backend does not recognise that name and used its `
       + 'default instead - fix the model list above.';
   } else if (servedModel) {
-    note = `\n\nServed by: ${servedModel.served}`;
+    note += `\n\nServed by: ${servedModel.served}`;
   }
 
   if (problems.length) {
@@ -271,6 +293,10 @@ function html(webview) {
   <label>Models <span class="hint">— comma separated, as the backend names them</span></label>
   <input id="models" placeholder="model-name-1, model-name-2" />
 
+  <label>Model field <span class="hint">— body key the picked model is sent in</span></label>
+  <input id="modelField" placeholder="model" />
+  <div class="saved">Must be the key your backend actually reads. If it is a different key, the picker changes nothing and every reply comes from the backend's default.</div>
+
   <label>Extra request fields <span class="hint">— JSON merged into every request body</span></label>
   <textarea id="identity" placeholder='{ "someField": "…", "nested": { … } }'></textarea>
 
@@ -320,6 +346,7 @@ function html(webview) {
       $('models').value = m.models || '';
       $('textPath').value = m.textPath || '';
       $('promptField').value = m.promptField || '';
+      $('modelField').value = m.modelField || '';
       $('identity').value = m.identity === '{}' ? '' : m.identity;
       $('params').value = m.params === '{}' ? '' : m.params;
       $('maxResponseChars').value = m.maxResponseChars;
@@ -354,6 +381,7 @@ function html(webview) {
       params: $('params').value,
       textPath: $('textPath').value,
       promptField: $('promptField').value,
+      modelField: $('modelField').value,
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
     });

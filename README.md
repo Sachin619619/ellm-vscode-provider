@@ -67,8 +67,18 @@ gateways there is nothing to write at all:
 | `ellm.authHeader` | header the token rides in | `X-Corp-Auth` |
 | `ellm.authPrefix` | text before the token, e.g. `Bearer ` | *(none)* |
 | `ellm.promptField` | body key holding the prompt | `prompt` |
+| `ellm.modelField` | body key holding the picked model | `model` |
 | `ellm.models` | model names, comma separated | — |
 | `ellm.textPath` | dot-path to the text in a frame | *(auto-detect)* |
+
+`ellm.modelField` is the one worth reading twice. A backend that doesn't recognise the key it
+arrives under doesn't complain — it answers from its default, and the reply looks exactly like a
+correct one. So picking a model in VS Code appears to work while every answer comes from the
+same model. Two guards: the panel warns when a field in the **extra request fields** block is
+fixed at something that also looks like a model name (which is what a request copied out of
+DevTools leaves behind — the real selector, frozen at whatever that one request used), and each
+request logs the field and value it sent to the output channel, so it can be compared against a
+DevTools capture directly.
 
 Two more live in the panel rather than `settings.json`, because they are private: a **Cookie**
 header, for gateways that want signed cookies alongside the token, and an **extra request

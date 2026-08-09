@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -105,6 +105,11 @@
           "type": "string",
           "default": "prompt",
           "markdownDescription": "Body field the prompt is sent in, e.g. `prompt`, `message`, `input`. Whatever your backend calls it."
+        },
+        "ellm.modelField": {
+          "type": "string",
+          "default": "model",
+          "markdownDescription": "Body field the picked model is sent in, e.g. `model`, `modelId`, `engine`. Whatever your backend calls it. **If this is not the key your backend actually reads, the model picker has no effect** — the name goes into a field the backend ignores and it answers from its default instead, which looks identical to a working setup."
         }
       }
     }

@@ -10,7 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding,
+  salvageText, stripPadding, modelFieldConflicts,
 } = require('../src/corpClient');
 const { repairJson, parseLenient } = require('../src/jsonRepair');
 
@@ -115,6 +115,104 @@ test('identity and params are merged into the body, never invented', async () =>
   assert.strictEqual(body.model, 'some-model');
   assert.strictEqual(body.stream, true);
   assert.strictEqual(body.prompt, 'Hi');
+});
+
+// --- which field carries the model ------------------------------------------
+//
+// A backend that reads a different key answers perfectly well from its default,
+// so nothing about the reply reveals that the picker was ignored. These pin the
+// request side, which is the only side that can be checked.
+
+test('the picked model goes in whichever body field the backend names', async () => {
+  const { seen } = await withFetch(response({ frames: ['{"text":"hi"}'] }),
+    () => converse(client({ modelField: 'AiModelName' }), { modelAlias: 'opus-4-8' }));
+  assert.strictEqual(seen[0].body.AiModelName, 'opus-4-8');
+  assert.strictEqual(seen[0].body.model, undefined);
+});
+
+test('a stale copy of the model in the extra fields never beats the picker', async () => {
+  const { seen } = await withFetch(response({ frames: ['{"text":"hi"}'] }),
+    () => converse(client({ identity: { model: 'captured-default' } }), { modelAlias: 'opus-4-8' }));
+  assert.strictEqual(seen[0].body.model, 'opus-4-8');
+});
+
+test('an extra field fixed at one of the model names is reported as a conflict', () => {
+  // The shape a DevTools capture leaves behind: the real selector, frozen at
+  // whatever that one request used, under a name this code cannot know.
+  const conflicts = modelFieldConflicts({
+    extra: { Flavour: 'some-other-model', Tenant: 'example.net' },
+    modelField: 'model',
+    models: ['opus 4.8', 'some-other-model'],
+  });
+  assert.deepStrictEqual(conflicts,
+    [{ path: 'Flavour', value: 'some-other-model', reason: 'names-a-model' }]);
+});
+
+test('a model-shaped extra field is reported even when its value is unfamiliar', () => {
+  const conflicts = modelFieldConflicts({
+    extra: { deployment: 'prod-eastus-2', Tenant: 'example.net' },
+    modelField: 'model',
+    models: ['opus 4.8'],
+  });
+  assert.deepStrictEqual(conflicts,
+    [{ path: 'deployment', value: 'prod-eastus-2', reason: 'model-shaped-key' }]);
+});
+
+test('a conflict nested inside the captured block is still found', () => {
+  const conflicts = modelFieldConflicts({
+    extra: { options: { llm: 'opus 4.8' } },
+    modelField: 'model',
+    models: ['opus 4.8'],
+  });
+  assert.deepStrictEqual(conflicts, [{ path: 'options.llm', value: 'opus 4.8', reason: 'names-a-model' }]);
+});
+
+test('the configured model field itself is reported as merely overridden', () => {
+  const conflicts = modelFieldConflicts({
+    extra: { model: 'captured-default' }, modelField: 'model', models: ['opus 4.8'],
+  });
+  assert.deepStrictEqual(conflicts, [{ path: 'model', reason: 'overridden' }]);
+});
+
+test('ordinary identity fields raise no conflict', () => {
+  assert.deepStrictEqual(modelFieldConflicts({
+    extra: { Tenant: 'example.net', userInfo: { mail: 'x@example.net' } },
+    modelField: 'model',
+    models: ['opus 4.8'],
+  }), []);
+});
+
+test('requestShape states the field and value without sending anything', () => {
+  const shape = client({ modelField: 'engine', identity: { engineName: 'opus 4.8' }, models: ['opus 4.8'] })
+    .requestShape({ modelAlias: 'opus 4.8' });
+  assert.strictEqual(shape.modelField, 'engine');
+  assert.strictEqual(shape.model, 'opus 4.8');
+  assert.strictEqual(shape.conflicts.length, 1);
+});
+
+test('a reply that names no model is reported unconfirmed, not as a match', async () => {
+  // The dangerous case: silence used to be indistinguishable from agreement.
+  let served;
+  await withFetch(response({ frames: ['{"completionText":"hi"}'] }),
+    () => converse(client(), { modelAlias: 'opus 4.8', onServedModel: (s) => { served = s; } }));
+  assert.strictEqual(served.confirmed, false);
+  assert.strictEqual(served.served, '');
+  assert.strictEqual(served.matches, null);
+});
+
+test('a reply that names a model is confirmed exactly once', async () => {
+  const seenModels = [];
+  await withFetch(response({ frames: ['{"model":"opus-4-8","text":"a"}', '{"model":"opus-4-8","text":"b"}'] }),
+    () => converse(client(), { modelAlias: 'opus 4.8', onServedModel: (s) => seenModels.push(s) }));
+  assert.strictEqual(seenModels.length, 1);
+  assert.strictEqual(seenModels[0].confirmed, true);
+  assert.strictEqual(seenModels[0].matches, true);
+});
+
+test('the gateway prelude is not mined for a model name', () => {
+  // Reading one out of the transport envelope would report a match against a
+  // field that describes the HTTP response, not the model that answered.
+  assert.strictEqual(modelFrom({ statusCode: 200, headers: { model: 'nginx' } }), '');
 });
 
 test('with nothing configured the body carries no company fields at all', async () => {
@@ -517,7 +615,7 @@ test('converse reports a mismatch when the backend substitutes its default', asy
     }),
   );
   assert.deepStrictEqual(seenModels, [
-    { requested: 'opus 5.1', served: 'internal-default-7b', matches: false },
+    { requested: 'opus 5.1', served: 'internal-default-7b', matches: false, confirmed: true },
   ]);
 });
 
@@ -546,7 +644,11 @@ test('the served model is reported once, not on every frame', async () => {
   assert.strictEqual(seenModels.length, 1);
 });
 
-test('a stream that names no model reports nothing rather than a false alarm', async () => {
+test('a stream that names no model says so rather than passing for a match', async () => {
+  // This used to report nothing at all, on the grounds that no evidence is not
+  // evidence of a mismatch. True, but it reads as agreement - and "the backend
+  // never said" is exactly the state a silent substitution lives in, so it is
+  // worth one line of its own.
   const seenModels = [];
   const { value } = await withFetch(
     response({ frames: ['{"text":"hi"}'] }),
@@ -555,6 +657,7 @@ test('a stream that names no model reports nothing rather than a false alarm', a
       onServedModel: (m) => seenModels.push(m),
     }),
   );
-  assert.strictEqual(seenModels.length, 0);
+  assert.deepStrictEqual(seenModels,
+    [{ requested: 'opus 5.1', served: '', matches: null, confirmed: false }]);
   assert.strictEqual(value.text, 'hi');
 });

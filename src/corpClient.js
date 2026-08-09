@@ -40,6 +40,7 @@ function stripPadding(text) {
 const DEFAULT_AUTH_HEADER = 'X-Corp-Auth';
 const DEFAULT_CHAT_PATH = '/chat';
 const DEFAULT_PROMPT_FIELD = 'prompt';
+const DEFAULT_MODEL_FIELD = 'model';
 
 /**
  * Where a streamed frame keeps its text. Backends disagree, so try the shapes that
@@ -210,6 +211,9 @@ function textFrom(frame, override) {
 /** The model a parsed frame says served it, or '' if it names none. */
 function modelFrom(frame, override) {
   if (!frame || typeof frame !== 'object') return '';
+  // The gateway prelude describes the HTTP response, so nothing in it names the
+  // model that answered - reading one out of it would report a false match.
+  if (!override && isTransportEnvelope(frame)) return '';
 
   if (override) {
     const found = dig(frame, override);
@@ -229,11 +233,75 @@ function modelFrom(frame, override) {
  * is a match. Only a name with no relation to the request is a real mismatch.
  */
 function sameModel(requested, served) {
-  const key = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const a = key(requested);
-  const b = key(served);
+  const a = normalizeModel(requested);
+  const b = normalizeModel(served);
   if (!a || !b) return true; // nothing to compare is not a mismatch
   return a.includes(b) || b.includes(a);
+}
+
+/** Model names for comparison: case, spaces, dots and dashes are all noise. */
+function normalizeModel(name) {
+  return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Key names that plausibly select a model, whatever a given backend calls it. */
+const MODEL_KEY_HINT = /model|engine|deployment|variant|\bllm\b/i;
+
+/**
+ * Extra request fields that may *also* be choosing a model.
+ *
+ * The extra-fields block is pasted verbatim out of one captured real request, so
+ * whatever key that request used to pick a model is sitting in it, frozen at the
+ * value that request happened to use. It is merged into every body afterwards.
+ * If the backend reads *that* key rather than the configured one, the picker
+ * changes nothing and every answer comes from one fixed model - which looks
+ * exactly like "I chose a model and got a different one".
+ *
+ * A value equal to one of the configured model names is the strong signal; a
+ * model-shaped key name is the weak one. Both are reported, neither is guessed at
+ * and silently rewritten: only the person who captured the request knows which
+ * key the backend really reads.
+ */
+function modelFieldConflicts({ extra, modelField, models = [] } = {}) {
+  const known = new Set(models.map(normalizeModel).filter(Boolean));
+  const found = [];
+
+  const walk = (value, path, depth) => {
+    if (!value || typeof value !== 'object' || depth > 4) return;
+    for (const [key, inner] of Object.entries(value)) {
+      const at = path ? `${path}.${key}` : key;
+      if (inner && typeof inner === 'object') {
+        walk(inner, at, depth + 1);
+        continue;
+      }
+      if (at === modelField) {
+        found.push({ path: at, reason: 'overridden' });
+        continue;
+      }
+      if (typeof inner !== 'string' || !inner.trim()) continue;
+      if (known.has(normalizeModel(inner))) found.push({ path: at, value: inner, reason: 'names-a-model' });
+      else if (MODEL_KEY_HINT.test(key)) found.push({ path: at, value: inner, reason: 'model-shaped-key' });
+    }
+  };
+
+  walk(extra, '', 0);
+  return found;
+}
+
+/** One line per conflict, phrased for someone staring at a DevTools capture. */
+function describeConflict(conflict, modelField) {
+  if (conflict.reason === 'overridden') {
+    return `"${conflict.path}" in the extra fields is ignored - the picked model is sent in "${modelField}".`;
+  }
+  if (conflict.reason === 'names-a-model') {
+    return `"${conflict.path}" is fixed at "${conflict.value}", which is one of your model names. `
+      + `If the backend reads that field instead of "${modelField}", every reply comes from `
+      + `"${conflict.value}" no matter what the picker says - set "Model field" to "${conflict.path}" `
+      + 'and delete it from the extra fields.';
+  }
+  return `"${conflict.path}" is fixed at "${conflict.value}" and is named like a model selector. `
+    + `If that is the field the backend reads, set "Model field" to "${conflict.path}" and remove it `
+    + 'from the extra fields, or the picker has no effect.';
 }
 
 /** 'stop' | 'length' | undefined - whether the backend says it stopped early. */
@@ -283,12 +351,16 @@ async function failureFor(res, url, client) {
 
 class CorpClient {
   constructor({
-    url, token, authHeader, authPrefix, cookie, chatPath, promptField,
+    url, token, authHeader, authPrefix, cookie, chatPath, promptField, modelField,
     model, models, identity, params, textPath, servedModelPath,
     contextChars, maxResponseChars,
   } = {}) {
     // Which body key carries the prompt is the backend's business, not this file's.
     this.promptField = promptField || DEFAULT_PROMPT_FIELD;
+    // Nor which key selects the model. `model` is only the common spelling of it,
+    // and a backend that spells it differently ignores the picker entirely while
+    // still answering perfectly - see modelFieldConflicts above.
+    this.modelField = modelField || DEFAULT_MODEL_FIELD;
     this.url = String(url || '').replace(/\/+$/, '');
     this.token = token || '';
     this.authHeader = authHeader || DEFAULT_AUTH_HEADER;
@@ -359,15 +431,35 @@ class CorpClient {
     return {
       ...this.identity, // whatever extra fields the backend expects, verbatim
       ...this.params, // tuning knobs, exactly as configured
-      model: modelAlias || this.model,
+      // Last, so the picked model always wins over a stale copy of itself in the
+      // extra fields. It cannot win over a *differently named* field, which is
+      // what modelFieldConflicts is for.
+      [this.modelField]: modelAlias || this.model,
       [this.promptField]: this.toPrompt(turns),
       stream: true,
     };
   }
 
+  /** What this request will send about the model, without sending it. */
+  requestShape({ modelAlias } = {}) {
+    const extra = { ...this.identity, ...this.params };
+    return {
+      modelField: this.modelField,
+      model: modelAlias || this.model,
+      conflicts: modelFieldConflicts({
+        extra,
+        modelField: this.modelField,
+        models: this.models,
+      }),
+    };
+  }
+
   /** Yields { type:'text', text } then a final { type:'finish', reason }. */
-  async *converse({ modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem }) {
+  async *converse({
+    modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest,
+  }) {
     const url = this.endpoint;
+    if (onRequest) onRequest(this.requestShape({ modelAlias }));
     const res = await fetch(url, {
       method: 'POST',
       headers: this.headers(),
@@ -396,7 +488,9 @@ class CorpClient {
       const served = modelFrom(frame, this.servedModelPath);
       if (!served) return;
       reportedModel = true;
-      onServedModel({ requested, served, matches: sameModel(requested, served) });
+      onServedModel({
+        requested, served, matches: sameModel(requested, served), confirmed: true,
+      });
     };
 
     const noteRaw = (raw) => {
@@ -528,6 +622,13 @@ class CorpClient {
     }
     for (const ev of drain(true)) yield ev;
 
+    // Say so when no frame named a model. Staying quiet here reads exactly like a
+    // clean match, so the one case where the picked model is unverifiable - the
+    // case where a silent substitution would hide - is the case that looked fine.
+    if (!reportedModel && onServedModel) {
+      onServedModel({ requested, served: '', matches: null, confirmed: false });
+    }
+
     if (!sawText) {
       // Carry the frame in the error itself. Telling someone to go and find it in an
       // output channel is one step too many when the answer is right here.
@@ -545,4 +646,5 @@ class CorpClient {
 module.exports = {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
   salvageText, stripPadding, isTransportEnvelope,
+  modelFieldConflicts, describeConflict, normalizeModel,
 };
