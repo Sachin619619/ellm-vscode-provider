@@ -86,10 +86,14 @@ async function runSelfTest(out) {
 
   try {
     const models = await vscode.lm.selectChatModels({ vendor: 'corp-ellm' });
-    check('provider exposes models to vscode.lm', models.length > 0, `${models.length} model(s)`);
+    // Name them. "3 model(s)" hid the case where every entry was the same model
+    // under the vendor id, which looks identical to a working list.
+    check('provider exposes models to vscode.lm', models.length > 0,
+      models.length ? models.map((m) => `${m.id} [family ${m.family}]`).join(', ') : 'none');
     if (!models.length) return finish(out, results);
 
     const model = models[0];
+    out.appendLine(`  (testing with the first of them: ${model.id})`);
     check('model advertises tool calling', model.capabilities?.toolCalling !== false, model.id);
 
     const cts = new vscode.CancellationTokenSource();

@@ -78,7 +78,12 @@ class EllmChatProvider {
       return info.models.map((m) => ({
         id: m.alias,
         name: `${m.label} (Enterprise)`,
-        family: 'corp-ellm',
+        // One family per model, not one for the whole provider. `corp-ellm` is the
+        // vendor id; using it here made every model identical to anything that
+        // selects by family - selectChatModels({family}) would match all of them
+        // and take the first, and surfaces that label by family showed the vendor
+        // id where the model name belongs.
+        family: m.alias,
         version: '1.0.0',
         maxInputTokens: Math.floor((m.contextChars ?? 400000) / 4),
         // Deliberately far above the upstream's per-response cap: the continuation
