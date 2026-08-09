@@ -64,6 +64,17 @@ function injectToolPrompt(messages, tools) {
   return [{ role: 'system', content: prompt }, ...messages];
 }
 
+/**
+ * Whether `text` ends inside a tool call the model never closed.
+ *
+ * Proof the answer is unfinished, whatever the backend's stop reason claims -
+ * see the continuation layer, which uses this to keep asking.
+ */
+function hasOpenToolCall(text) {
+  const open = text.lastIndexOf(OPEN);
+  return open !== -1 && text.indexOf(CLOSE, open) === -1;
+}
+
 /** How many trailing chars of `buf` could be the start of `tag`. */
 function partialTagTail(buf, tag) {
   for (let i = Math.min(buf.length, tag.length - 1); i > 0; i--) {
@@ -81,6 +92,31 @@ class ToolCallScanner {
   #inCall = false;
   #seq = 0;
   #emitted = false;
+  #onProblem;
+
+  /**
+   * `onProblem` is told about a tool call that would not parse. Without it the
+   * only evidence is a wall of markup in the chat, which says nothing about
+   * whether the call was cut off mid-write or was simply not JSON - and those
+   * have opposite fixes.
+   */
+  constructor(onProblem) {
+    this.#onProblem = onProblem || (() => {});
+  }
+
+  /** Why a call did not parse, in one line, with enough of it to tell. */
+  #reportUnparsed(raw, closed) {
+    const head = raw.slice(0, 200).replace(/\s+/g, ' ');
+    const tail = raw.length > 200 ? raw.slice(-120).replace(/\s+/g, ' ') : '';
+    const balance = [...raw].reduce((n, c) => n + (c === '{' ? 1 : c === '}' ? -1 : 0), 0);
+
+    this.#onProblem(
+      `tool call not parsed (${raw.length} chars, ${closed ? 'closed' : 'NEVER CLOSED'}, `
+      + `${balance > 0 ? `${balance} brace(s) still open` : 'braces balanced'}). `
+      + `It was shown in the chat as text instead of being run.\n  starts: ${head}`
+      + (tail ? `\n  ends: ...${tail}` : ''),
+    );
+  }
 
   push(chunk) {
     this.#buf += chunk;
@@ -97,8 +133,12 @@ class ToolCallScanner {
 
         const call = this.#toCall(raw);
         if (call) calls.push(call);
-        // Malformed call - surface it as text so the model can self-correct.
-        else text += `${OPEN}${raw}${CLOSE}`;
+        else {
+          // Malformed call - surface it as text so the model can self-correct,
+          // and say so in the log, where the reason is actually readable.
+          this.#reportUnparsed(raw, true);
+          text += `${OPEN}${raw}${CLOSE}`;
+        }
         continue;
       }
 
@@ -146,6 +186,9 @@ class ToolCallScanner {
 
     const call = this.#toCall(inCall ? buf.replace(BROKEN_CLOSE_TAIL, '') : buf);
     if (call) return { text: '', calls: [call] };
+    // A call still open at end of stream was cut off rather than mis-written -
+    // the upstream response cap lands mid-JSON on any sizeable file.
+    if (inCall) this.#reportUnparsed(buf, false);
     return { text: inCall ? OPEN + buf : buf, calls: [] };
   }
 
@@ -175,4 +218,4 @@ class ToolCallScanner {
   }
 }
 
-module.exports = { buildToolPrompt, injectToolPrompt, ToolCallScanner };
+module.exports = { buildToolPrompt, injectToolPrompt, ToolCallScanner, hasOpenToolCall };

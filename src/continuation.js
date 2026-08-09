@@ -131,7 +131,20 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
     // Trust an explicit stop reason; only measure length when told nothing.
     const truncated = finish === 'length'
       || (finish == null && cap > 0 && rawLength >= cap - tolerance);
-    if (!truncated) break;
+
+    /**
+     * ...unless the answer is provably unfinished.
+     *
+     * A backend is free to report a clean stop for a response it cut at the cap,
+     * and some do. That is harmless in prose - a sentence ends early - but fatal
+     * for a tool call: the JSON stops mid-string, nothing can parse it, and the
+     * call is rendered into the chat as markup while the file it was supposed to
+     * write never appears. An unclosed tool call is not an opinion about whether
+     * the model was done, it is evidence that it was not.
+     */
+    const unfinished = Boolean(opts.needsMore?.(full));
+    if (!truncated && !unfinished) break;
+    if (!truncated && unfinished) log('the answer stopped inside an unfinished tool call, continuing');
 
     if (++round > maxRounds) {
       hitLimit = true;
@@ -140,7 +153,10 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
     log(`hit the ${cap}-char cap, continuing (round ${round})`);
   }
 
-  if (hitLimit) log(`stopped after ${maxRounds} continuations - raise ellm.maxContinuations`);
+  if (hitLimit) {
+    log(`stopped after ${maxRounds} continuations - raise ellm.maxContinuations`
+      + `${opts.needsMore?.(full) ? '. The tool call is STILL unfinished, so it cannot run.' : ''}`);
+  }
   yield { type: 'finish', reason: 'stop', text: full };
 }
 

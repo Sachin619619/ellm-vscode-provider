@@ -1,7 +1,7 @@
 const vscode = require('vscode');
 const { CorpClient, CorpAuthError, describeConflict, describeRequest } = require('./corpClient');
 const { withContinuation } = require('./continuation');
-const { buildToolPrompt, ToolCallScanner } = require('./toolshim');
+const { buildToolPrompt, ToolCallScanner, hasOpenToolCall } = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
 
 /** Read a VS Code message part without depending on class identity across API versions. */
@@ -118,7 +118,9 @@ class EllmChatProvider {
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());
 
-    const scanner = shimming ? new ToolCallScanner() : null;
+    const scanner = shimming
+      ? new ToolCallScanner((msg) => this.log(`TOOL CALL PROBLEM: ${msg}`))
+      : null;
     const started = Date.now();
     let chars = 0;
     let calls = 0;
@@ -144,7 +146,11 @@ class EllmChatProvider {
 
       const stream = withContinuation(rounds, turns, {
         maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
-        maxContinuations: readSetting(this.context, 'maxContinuations', 8),
+        maxContinuations: readSetting(this.context, 'maxContinuations', 20),
+        // A file written through a 5000-char cap arrives over many rounds, and a
+        // backend that reports a clean stop for a capped response would otherwise
+        // end the answer mid-JSON. An unclosed tool call settles it.
+        needsMore: shimming ? hasOpenToolCall : undefined,
         signal: controller.signal,
         log: (m) => this.log(m),
       });

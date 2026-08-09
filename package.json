@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -63,8 +63,8 @@
         },
         "ellm.maxContinuations": {
           "type": "number",
-          "default": 8,
-          "description": "Safety limit on how many times one answer may be continued."
+          "default": 20,
+          "description": "Safety limit on how many times one answer may be continued. A file written through the response cap needs one round per cap-full of text, so a large file needs many."
         },
         "ellm.tokenStorage": {
           "type": "string",
@@ -99,7 +99,7 @@
         "ellm.servedModelPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Dot-path to the model name inside a streamed frame, e.g. `metadata.model`. Leave blank to auto-detect. Used to warn when the backend serves a different model than the one you picked \u2014 an unknown model name is usually answered with the backend's default rather than an error."
+          "markdownDescription": "Dot-path to the model name inside a streamed frame, e.g. `metadata.model`. Leave blank to auto-detect. Used to warn when the backend serves a different model than the one you picked — an unknown model name is usually answered with the backend's default rather than an error."
         },
         "ellm.promptField": {
           "type": "string",
