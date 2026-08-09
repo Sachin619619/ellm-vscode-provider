@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { CorpClient, CorpAuthError, describeConflict } = require('./corpClient');
+const { CorpClient, CorpAuthError, describeConflict, describeRequest } = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const { buildToolPrompt, ToolCallScanner } = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
@@ -233,8 +233,20 @@ class EllmChatProvider {
    * request side is stated out loud, and a fixed model sitting in the extra
    * fields is called out as the thing that would override the picker.
    */
-  reportRequestShape({ modelField, model, conflicts }) {
+  reportRequestShape({ modelField, model, conflicts, url, body, headers }) {
     this.log(`requesting model "${model}" in body field "${modelField}"`);
+
+    // Opt-in, because the body carries the identity block and this channel gets
+    // pasted into chat windows. Off by default; turned on to compare against the
+    // web app's payload, then turned off again.
+    const mode = readSetting(this.context, 'logRequestBody', 'off');
+    if (mode === 'keys' || mode === 'full') {
+      this.log(`request payload (${mode}):\n${describeRequest(
+        { url, body, headers, promptField: readSetting(this.context, 'promptField', 'prompt') },
+        { values: mode === 'full' },
+      )}`);
+    }
+
     if (!conflicts.length) return;
 
     for (const conflict of conflicts) {

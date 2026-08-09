@@ -10,7 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding, modelFieldConflicts,
+  salvageText, stripPadding, modelFieldConflicts, describeRequest,
 } = require('../src/corpClient');
 const { repairJson, parseLenient } = require('../src/jsonRepair');
 
@@ -213,6 +213,43 @@ test('the gateway prelude is not mined for a model name', () => {
   // Reading one out of the transport envelope would report a match against a
   // field that describes the HTTP response, not the model that answered.
   assert.strictEqual(modelFrom({ statusCode: 200, headers: { model: 'nginx' } }), '');
+});
+
+// --- reading the payload back -----------------------------------------------
+
+test('the payload view shows the model field and hides the credentials', () => {
+  const shape = client({
+    authHeader: 'Authorization', authPrefix: 'Bearer ', cookie: 'sess=abc',
+    modelField: 'engine', identity: { Tenant: 'example.net' },
+  }).requestShape({ modelAlias: 'opus 4.8', turns: [{ speaker: 'human', utterance: 'hello there' }] });
+
+  const shown = describeRequest({ ...shape, promptField: 'prompt' });
+  assert.match(shown, /"engine": "opus 4\.8"/); // the whole point of looking
+  assert.match(shown, /"Tenant": "example\.net"/); // configuration stays visible
+  assert.doesNotMatch(shown, /Bearer tok/); // credentials never
+  assert.doesNotMatch(shown, /sess=abc/);
+  assert.doesNotMatch(shown, /hello there/); // nor the file being worked on
+  assert.match(shown, /<prompt, 11 chars, hidden>/);
+});
+
+test('key mode shows the shape without any configured values', () => {
+  const shape = client({ identity: { Tenant: 'example.net' } })
+    .requestShape({ modelAlias: 'opus 4.8', turns: [{ speaker: 'human', utterance: 'hi' }] });
+
+  const shown = describeRequest({ ...shape, promptField: 'prompt' }, { values: false });
+  assert.match(shown, /"Tenant": "string"/); // the key, not what is in it
+  assert.doesNotMatch(shown, /example\.net/);
+});
+
+test('a credential nested inside the identity block is masked too', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: {},
+    body: { user: { name: 'A Person', sessionToken: 'super-secret' } },
+    promptField: 'prompt',
+  });
+  assert.doesNotMatch(shown, /super-secret/);
+  assert.match(shown, /"name": "A Person"/);
 });
 
 test('with nothing configured the body carries no company fields at all', async () => {

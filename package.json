@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -105,6 +105,21 @@
           "type": "string",
           "default": "prompt",
           "markdownDescription": "Body field the prompt is sent in, e.g. `prompt`, `message`, `input`. Whatever your backend calls it."
+        },
+        "ellm.logRequestBody": {
+          "type": "string",
+          "enum": [
+            "off",
+            "keys",
+            "full"
+          ],
+          "default": "off",
+          "enumDescriptions": [
+            "Log only the model field and value.",
+            "Log the body's key names and value types — enough to find the field that selects the model.",
+            "Log the whole body. Credentials and the prompt are still hidden."
+          ],
+          "markdownDescription": "How much of each outgoing request to write to the **Enterprise LLM** output channel — the equivalent of reading the payload in your browser's DevTools. `keys` shows the shape only; `full` shows the values. Credential-looking fields and the prompt itself are hidden in both. Use it to compare what the extension sends against what the web app sends, then turn it back `off`."
         },
         "ellm.modelField": {
           "type": "string",

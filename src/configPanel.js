@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { CorpClient, describeConflict } = require('./corpClient');
+const { CorpClient, describeConflict, describeRequest } = require('./corpClient');
 const {
   getToken, setToken, clearToken, tokenLocation, getCookie, setCookie,
   getPrivate, setPrivate, readSetting, saveSettings, COOKIE_KEY, clearSecret,
@@ -178,6 +178,15 @@ async function smokeTest(client) {
   let note = '';
   if (shape) {
     note += `\n\nAsked for "${shape.model}" in body field "${shape.modelField}".`;
+    // The exact payload, always - this is the one request whose prompt is a fixed
+    // harmless string, so showing it costs nothing and it is the only way to
+    // compare against what the web app sends without guessing.
+    note += `\n\nWHAT WAS SENT\n${describeRequest({
+      url: shape.url,
+      body: shape.body,
+      headers: shape.headers,
+      promptField: client.promptField,
+    })}`;
     if (shape.conflicts.length) {
       // The panel is where this belongs: it is the one place that can see both the
       // model list and the pasted extra fields at the same time, which is the only

@@ -288,6 +288,56 @@ function modelFieldConflicts({ extra, modelField, models = [] } = {}) {
   return found;
 }
 
+/** Header and body keys whose values are credentials rather than configuration. */
+const SECRET_KEY_HINT = /token|secret|password|auth|cookie|apikey|api_key|credential|session/i;
+
+/**
+ * The request as text, for reading beside the web app's payload in DevTools.
+ *
+ * Two things are held back even though this is the machine that owns them: the
+ * credentials, because a log gets pasted into a chat window the moment something
+ * is confusing, and the prompt, because it is the source file being worked on.
+ * Everything that decides *which model answers* is shown in full - that is the
+ * whole point of looking.
+ */
+function describeRequest({ url, body, headers, promptField }, { values = true } = {}) {
+  const mask = (key, value) => {
+    if (SECRET_KEY_HINT.test(key)) {
+      const len = String(value ?? '').length;
+      return `<${len} chars, hidden>`;
+    }
+    if (key === promptField) {
+      const len = String(value ?? '').length;
+      return `<prompt, ${len} chars, hidden>`;
+    }
+    return value;
+  };
+
+  const walk = (value, key) => {
+    if (Array.isArray(value)) return value.map((v) => walk(v, key));
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, k)]));
+    }
+    const masked = mask(key, value);
+    // Key-name mode: enough to find the field that selects the model, without
+    // putting the tenant, the user block or anything else on screen.
+    if (!values && masked === value) return typeof value;
+    return masked;
+  };
+
+  const shownHeaders = Object.fromEntries(
+    Object.entries(headers || {}).map(([k, v]) => [k, mask(k, v)]),
+  );
+
+  return [
+    `POST ${url}`,
+    'headers:',
+    JSON.stringify(shownHeaders, null, 2),
+    'body:',
+    JSON.stringify(walk(body, ''), null, 2),
+  ].join('\n');
+}
+
 /** One line per conflict, phrased for someone staring at a DevTools capture. */
 function describeConflict(conflict, modelField) {
   if (conflict.reason === 'overridden') {
@@ -441,11 +491,17 @@ class CorpClient {
   }
 
   /** What this request will send about the model, without sending it. */
-  requestShape({ modelAlias } = {}) {
+  requestShape({ modelAlias, turns = [] } = {}) {
     const extra = { ...this.identity, ...this.params };
     return {
       modelField: this.modelField,
       model: modelAlias || this.model,
+      url: this.endpoint,
+      // The payload itself, so it can be read the way the web app's is read in
+      // DevTools. Masking happens at the point of display, not here - callers
+      // that need the real body (the request) must not get a redacted one.
+      body: this.body({ modelAlias, turns }),
+      headers: this.headers(),
       conflicts: modelFieldConflicts({
         extra,
         modelField: this.modelField,
@@ -459,7 +515,7 @@ class CorpClient {
     modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest,
   }) {
     const url = this.endpoint;
-    if (onRequest) onRequest(this.requestShape({ modelAlias }));
+    if (onRequest) onRequest(this.requestShape({ modelAlias, turns }));
     const res = await fetch(url, {
       method: 'POST',
       headers: this.headers(),
@@ -646,5 +702,5 @@ class CorpClient {
 module.exports = {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
   salvageText, stripPadding, isTransportEnvelope,
-  modelFieldConflicts, describeConflict, normalizeModel,
+  modelFieldConflicts, describeConflict, normalizeModel, describeRequest,
 };
