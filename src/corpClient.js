@@ -72,6 +72,107 @@ function takeJson(buf) {
   return { incomplete: true };
 }
 
+/** Control characters JSON spells out rather than carrying literally. */
+const CONTROL_ESCAPES = {
+  '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f',
+};
+
+/**
+ * Escape the raw control characters a frame should never have contained.
+ *
+ * A backend that builds its frames by concatenating strings instead of running a
+ * serialiser will happily put a literal newline inside a string literal. JSON
+ * forbids that, so one of them makes the entire frame unparseable - and an
+ * unparseable frame used to be shown to the user verbatim, envelope and all.
+ */
+function repairControlChars(raw) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (const c of raw) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      else if (c < ' ') {
+        out += CONTROL_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
+        continue;
+      }
+    } else if (c === '"') inString = true;
+    out += c;
+  }
+  return out;
+}
+
+/**
+ * The value of the first of `keys` that appears in `raw` as a string field, read
+ * straight out of the text. No parser involved: this runs precisely when parsing
+ * has already failed, and on a fragment the stream ended in the middle of.
+ */
+function textByKey(raw, keys) {
+  for (const key of keys) {
+    const at = raw.indexOf(`"${key}"`);
+    if (at === -1) continue;
+
+    let i = at + key.length + 2;
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (raw[i] !== ':') continue;
+    i++;
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (raw[i] !== '"') continue;
+
+    let end = -1;
+    let escaped = false;
+    for (let k = i + 1; k < raw.length; k++) {
+      const c = raw[k];
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') { end = k; break; }
+    }
+
+    // No closing quote means the stream stopped mid-value; close it ourselves,
+    // dropping a dangling backslash that would otherwise escape the quote we add.
+    const literal = end === -1
+      ? `${raw.slice(i).replace(/\\+$/, (m) => (m.length % 2 ? m.slice(0, -1) : m))}"`
+      : raw.slice(i, end + 1);
+
+    try {
+      const value = JSON.parse(repairControlChars(literal));
+      if (typeof value === 'string' && value) return value;
+    } catch { /* try the next key */ }
+  }
+  return '';
+}
+
+/**
+ * The text inside a frame that would not parse, or '' if there is none to find.
+ *
+ * Recovering the answer and losing the wrapper beats showing the wrapper: nobody
+ * reading a chat reply wants `{"completionText":"..."}` in it, and the frame shape
+ * is a fact about the transport, not something the model said.
+ */
+function salvageText(raw, override) {
+  const repaired = repairControlChars(raw);
+  if (repaired !== raw) {
+    try {
+      const text = textFrom(JSON.parse(repaired), override);
+      if (text) return text;
+    } catch { /* fall through to reading it as text */ }
+  }
+
+  const keys = override
+    ? [override.split('.').pop()]
+    : [...new Set(TEXT_PATHS.map((p) => p.split('.').pop()))].filter((k) => !/^\d+$/.test(k));
+  return textByKey(raw, keys);
+}
+
+/** Whether `raw` is a JSON value at all - anything else is legitimately plain text. */
+function looksLikeJson(raw) {
+  const c = raw.trimStart()[0];
+  return c === '{' || c === '[';
+}
+
 const FINISH_KEYS = ['stopReason', 'stop_reason', 'finishReason', 'finish_reason'];
 /** Frame-level markers that mean "the answer was cut short, ask for the rest". */
 const TRUNCATED = /^(charlimit|length|max_tokens|max_output_tokens|truncated)$/i;
@@ -92,10 +193,23 @@ function dig(obj, path) {
   return path.split('.').reduce((acc, key) => (acc == null ? undefined : acc[key]), obj);
 }
 
+/**
+ * An API-gateway transport envelope - the `{"statusCode":200,"headers":{...}}` this
+ * backend puts in front of the real frames. It describes the HTTP response, so no
+ * field in it is ever part of the answer.
+ */
+function isTransportEnvelope(frame) {
+  return Boolean(frame)
+    && typeof frame === 'object'
+    && ('statusCode' in frame || 'status_code' in frame)
+    && 'headers' in frame;
+}
+
 /** The text carried by one parsed frame, or '' if it carries none. */
 function textFrom(frame, override) {
   if (typeof frame === 'string') return frame;
   if (!frame || typeof frame !== 'object') return '';
+  if (!override && isTransportEnvelope(frame)) return '';
 
   if (override) {
     const found = dig(frame, override);
@@ -267,7 +381,7 @@ class CorpClient {
   }
 
   /** Yields { type:'text', text } then a final { type:'finish', reason }. */
-  async *converse({ modelAlias, turns, signal, onRawFrame, onServedModel }) {
+  async *converse({ modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem }) {
     const url = this.endpoint;
     const res = await fetch(url, {
       method: 'POST',
@@ -309,7 +423,33 @@ class CorpClient {
       if (onRawFrame) onRawFrame(firstRaw);
     };
 
+    const noteProblem = (msg) => {
+      if (onFrameProblem) onFrameProblem(msg);
+    };
+
+    /**
+     * A frame this reader could not parse. Whatever went wrong upstream, the one
+     * thing that must not happen is the envelope reaching the chat as if the model
+     * had written it: a reply that opens `{"completionText":"I'll impl"}ement...`
+     * is worse than a reply missing a fragment, and it poisons the history the
+     * next turn is built from. Recover the text, report the frame to the log.
+     */
+    const asBrokenFrame = (raw) => {
+      noteRaw(raw);
+      const text = salvageText(raw, this.textPath);
+      const shown = raw.length > 200 ? `${raw.slice(0, 200)}...` : raw;
+      if (!text) {
+        noteProblem(`dropped an unreadable frame (no text in it): ${shown}`);
+        return [];
+      }
+      noteProblem(`recovered ${text.length} char(s) from an unreadable frame: ${shown}`);
+      sawText = true;
+      return [{ type: 'text', text }];
+    };
+
     const asText = (text) => {
+      // A line that is really a frame gets treated as one however it got here.
+      if (looksLikeJson(text)) return asBrokenFrame(text);
       noteRaw(text);
       sawText = true;
       return [{ type: 'text', text }];
@@ -321,9 +461,7 @@ class CorpClient {
       try {
         frame = JSON.parse(raw);
       } catch {
-        // Balanced but not valid JSON - show it rather than swallow it.
-        sawText = true;
-        return [{ type: 'text', text: raw }];
+        return asBrokenFrame(raw); // balanced braces, but not valid JSON
       }
 
       noteModel(frame);
@@ -371,7 +509,8 @@ class CorpClient {
           const taken = takeJson(buffer);
           if (taken?.incomplete) {
             if (!final) break; // wait for the rest of the object
-            events.push(...asText(buffer));
+            // The stream stopped mid-object, which is what a per-response cap does.
+            events.push(...asBrokenFrame(buffer));
             buffer = '';
             break;
           }
@@ -418,4 +557,7 @@ class CorpClient {
   }
 }
 
-module.exports = { CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel };
+module.exports = {
+  CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
+  salvageText, repairControlChars, isTransportEnvelope,
+};

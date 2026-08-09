@@ -150,12 +150,14 @@ async function smokeTest(client) {
   let text = '';
   let firstFrame = '';
   let servedModel = null;
+  const problems = [];
 
   const stream = client.converse({
     modelAlias: client.models[0]?.alias ?? client.models[0] ?? undefined,
     turns: [{ speaker: 'human', utterance: 'Reply with exactly: OK' }],
     onRawFrame: (raw) => { firstFrame = raw; },
     onServedModel: (served) => { servedModel = served; },
+    onFrameProblem: (msg) => problems.push(msg),
   });
 
   for await (const ev of stream) {
@@ -176,6 +178,13 @@ async function smokeTest(client) {
       + 'default instead - fix the model list above.';
   } else if (servedModel) {
     note = `\n\nServed by: ${servedModel.served}`;
+  }
+
+  if (problems.length) {
+    // The answer came through, so this is not a failure - but a stream that needs
+    // repairing on every frame is a text-field or shape problem worth naming here
+    // rather than leaving in the output channel.
+    note += `\n\n${problems.length} frame(s) needed repairing. First: ${problems[0]}`;
   }
 
   return `Connected in ${Date.now() - started}ms. The model replied: `

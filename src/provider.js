@@ -125,6 +125,10 @@ class EllmChatProvider {
         // is the difference between a five-minute fix and an afternoon.
         onRawFrame: (raw) => this.log(`first raw frame: ${raw}`),
         onServedModel: (served) => this.reportServedModel(served),
+        // A frame the reader could not read is never shown in the chat, so the
+        // log is the only place it exists. Without this line a recovered or
+        // dropped frame would be invisible.
+        onFrameProblem: (msg) => this.log(`frame problem: ${msg}`),
       });
 
       const stream = withContinuation(rounds, turns, {

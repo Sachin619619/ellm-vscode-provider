@@ -23,7 +23,7 @@ so your models appear in the normal model picker next to everything else.
 Grab the `.vsix` from [Releases](../../releases) and:
 
 ```bash
-code --install-extension ellm-provider-0.2.0.vsix
+code --install-extension ellm-provider-0.2.4.vsix
 ```
 
 Requires VS Code 1.104 or newer.

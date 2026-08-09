@@ -10,6 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
+  salvageText, repairControlChars,
 } = require('../src/corpClient');
 
 /** Minimal stand-in for a fetch Response, streaming `frames` as SSE lines. */
@@ -345,6 +346,71 @@ test('a frame carrying no text is skipped silently, not shown', async () => {
   const body = '{"statusCode":200,"headers":{}}{"completionText":"only this"}';
   const { value } = await withFetch(response({ body }), () => converse(client()));
   assert.strictEqual(value.text, 'only this');
+});
+
+// --- frames that will not parse ----------------------------------------------
+// The reader used to show an unreadable frame verbatim, so a reply could open
+// with `{"completionText":"I'll impl"}ement Option 1...`. That is worse than a
+// missing fragment: it is unreadable, and VS Code replays it as history, so the
+// model starts imitating the envelope. Never show one - recover what is in it.
+
+test('an unparseable frame never reaches the user as raw JSON', async () => {
+  // A literal newline inside the string is what a backend that concatenates
+  // strings instead of serialising emits. JSON forbids it, so the frame is broken.
+  const body = '{"completionText":"I\'ll impl\nement Option 1"}{"completionText":" for v3"}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.ok(!value.text.includes('completionText'), `envelope leaked: ${value.text}`);
+  assert.strictEqual(value.text, "I'll impl\nement Option 1 for v3");
+});
+
+test('a stream cut off mid-frame yields its text, not the fragment', async () => {
+  // Exactly what a per-response character cap does: the last frame never closes.
+  const body = '{"completionText":"Hello "}{"completionText":"and this is where it stop';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.ok(!value.text.includes('completionText'), `envelope leaked: ${value.text}`);
+  assert.strictEqual(value.text, 'Hello and this is where it stop');
+});
+
+test('an unreadable frame is reported to the log, since it is not shown', async () => {
+  const problems = [];
+  const body = '{"completionText":"a\tb"}';
+  await withFetch(response({ body }), () => converse(client(), {
+    onFrameProblem: (m) => problems.push(m),
+  }));
+  assert.strictEqual(problems.length, 1);
+  assert.match(problems[0], /recovered/);
+});
+
+test('an unreadable frame with no text in it is dropped, not printed', async () => {
+  const body = '{"statusCode":200,"headers":{"X":"a\nb"}}{"completionText":"the answer"}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.strictEqual(value.text, 'the answer');
+});
+
+test('an explicit textPath is honoured when salvaging too', async () => {
+  const body = '{"payload":{"deltaText":"one\ntwo"}}';
+  const { value } = await withFetch(response({ body }),
+    () => converse(client({ textPath: 'payload.deltaText' })));
+  assert.strictEqual(value.text, 'one\ntwo');
+});
+
+test('a transport envelope is never mined for text, whatever it contains', () => {
+  assert.strictEqual(textFrom({ statusCode: 200, headers: {}, message: 'Forbidden' }), '');
+  assert.strictEqual(textFrom({ statusCode: 502, headers: {}, data: 'Bad Gateway' }), '');
+  // Without the envelope markers these are ordinary frames and still work.
+  assert.strictEqual(textFrom({ message: 'hi' }), 'hi');
+});
+
+test('salvageText reads a value the parser rejected', () => {
+  assert.strictEqual(salvageText('{"completionText":"a\nb"}'), 'a\nb');
+  assert.strictEqual(salvageText('{"completionText":"unterminated'), 'unterminated');
+  assert.strictEqual(salvageText('{"completionText":"ends in a backslash\\'), 'ends in a backslash');
+  assert.strictEqual(salvageText('{"nothing":"useful"}'), '');
+});
+
+test('repairControlChars leaves an already-valid frame untouched', () => {
+  const good = '{"completionText":"line one\\nline two"}';
+  assert.strictEqual(repairControlChars(good), good);
 });
 
 // --- which model actually answered -------------------------------------------
