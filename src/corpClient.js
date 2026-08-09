@@ -16,7 +16,26 @@
  * one file that changes when the backend does.
  */
 
+const { repairJson, parseLenient } = require('./jsonRepair');
+
 class CorpAuthError extends Error {}
+
+/**
+ * Padding between frames, which is not always whitespace.
+ *
+ * AWS Lambda response streaming separates its `{"statusCode":...,"headers":{...}}`
+ * prelude from the payload with **eight NUL bytes**. NUL is not whitespace, so
+ * trimming does not remove it, and the first real frame arrives welded to it:
+ * `\0\0\0\0\0\0\0\0{"completionText":"Let me ver"}`. That does not start with `{`,
+ * so it misses the JSON branch entirely and gets printed as if it were prose -
+ * which is why a reply would open with the envelope and then continue cleanly,
+ * every time, on the first frame only.
+ */
+const PADDING = /^[\s\u0000-\u001f\u007f\ufeff]+/;
+
+function stripPadding(text) {
+  return text.replace(PADDING, '');
+}
 
 const DEFAULT_AUTH_HEADER = 'X-Corp-Auth';
 const DEFAULT_CHAT_PATH = '/chat';
@@ -72,39 +91,6 @@ function takeJson(buf) {
   return { incomplete: true };
 }
 
-/** Control characters JSON spells out rather than carrying literally. */
-const CONTROL_ESCAPES = {
-  '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f',
-};
-
-/**
- * Escape the raw control characters a frame should never have contained.
- *
- * A backend that builds its frames by concatenating strings instead of running a
- * serialiser will happily put a literal newline inside a string literal. JSON
- * forbids that, so one of them makes the entire frame unparseable - and an
- * unparseable frame used to be shown to the user verbatim, envelope and all.
- */
-function repairControlChars(raw) {
-  let out = '';
-  let inString = false;
-  let escaped = false;
-
-  for (const c of raw) {
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (c === '\\') escaped = true;
-      else if (c === '"') inString = false;
-      else if (c < ' ') {
-        out += CONTROL_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
-        continue;
-      }
-    } else if (c === '"') inString = true;
-    out += c;
-  }
-  return out;
-}
-
 /**
  * The value of the first of `keys` that appears in `raw` as a string field, read
  * straight out of the text. No parser involved: this runs precisely when parsing
@@ -138,7 +124,7 @@ function textByKey(raw, keys) {
       : raw.slice(i, end + 1);
 
     try {
-      const value = JSON.parse(repairControlChars(literal));
+      const value = JSON.parse(repairJson(literal));
       if (typeof value === 'string' && value) return value;
     } catch { /* try the next key */ }
   }
@@ -153,23 +139,22 @@ function textByKey(raw, keys) {
  * is a fact about the transport, not something the model said.
  */
 function salvageText(raw, override) {
-  const repaired = repairControlChars(raw);
-  if (repaired !== raw) {
-    try {
-      const text = textFrom(JSON.parse(repaired), override);
-      if (text) return text;
-    } catch { /* fall through to reading it as text */ }
+  const padded = stripPadding(raw);
+  const parsed = parseLenient(padded);
+  if (parsed) {
+    const text = textFrom(parsed.value, override);
+    if (text) return text;
   }
 
   const keys = override
     ? [override.split('.').pop()]
     : [...new Set(TEXT_PATHS.map((p) => p.split('.').pop()))].filter((k) => !/^\d+$/.test(k));
-  return textByKey(raw, keys);
+  return textByKey(padded, keys);
 }
 
 /** Whether `raw` is a JSON value at all - anything else is legitimately plain text. */
 function looksLikeJson(raw) {
-  const c = raw.trimStart()[0];
+  const c = stripPadding(raw)[0];
   return c === '{' || c === '[';
 }
 
@@ -481,7 +466,7 @@ class CorpClient {
       const events = [];
 
       for (;;) {
-        buffer = buffer.replace(/^\s+/, '');
+        buffer = stripPadding(buffer);
         if (!buffer) break;
 
         // SSE bookkeeping lines carry no payload.
@@ -559,5 +544,5 @@ class CorpClient {
 
 module.exports = {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, repairControlChars, isTransportEnvelope,
+  salvageText, stripPadding, isTransportEnvelope,
 };

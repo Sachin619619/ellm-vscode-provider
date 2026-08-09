@@ -10,8 +10,9 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, repairControlChars,
+  salvageText, stripPadding,
 } = require('../src/corpClient');
+const { repairJson, parseLenient } = require('../src/jsonRepair');
 
 /** Minimal stand-in for a fetch Response, streaming `frames` as SSE lines. */
 function response({ status = 200, body = '', contentType = 'text/event-stream', frames }) {
@@ -408,9 +409,70 @@ test('salvageText reads a value the parser rejected', () => {
   assert.strictEqual(salvageText('{"nothing":"useful"}'), '');
 });
 
-test('repairControlChars leaves an already-valid frame untouched', () => {
+test('repairJson leaves an already-valid frame untouched', () => {
   const good = '{"completionText":"line one\\nline two"}';
-  assert.strictEqual(repairControlChars(good), good);
+  assert.strictEqual(repairJson(good), good);
+});
+
+// --- the NUL padding Lambda puts between its prelude and the payload ----------
+// AWS Lambda response streaming ends its prelude with eight NUL bytes. NUL is not
+// whitespace, so the first real frame arrives welded to them and misses the JSON
+// branch: the reply opened with `{"completionText":"Let me ver"}ify ...` every
+// time, on the first frame only, with the NULs rendered as boxes in front.
+
+const NUL = '\u0000'.repeat(8);
+
+test('NUL padding after the prelude does not print the first frame as prose', async () => {
+  const body = `{"statusCode":200,"headers":{"Content-Type":"text/event-stream"}}${NUL}`
+    + '{"completionText":"Let me ver"}\n{"completionText":"ify the file."}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.ok(!value.text.includes('completionText'), `envelope leaked: ${value.text}`);
+  assert.ok(!value.text.includes('\u0000'), 'NUL bytes reached the user');
+  assert.strictEqual(value.text, 'Let me verify the file.');
+});
+
+test('padded frames work whether or not newlines separate them', async () => {
+  const body = `{"statusCode":200,"headers":{}}${NUL}`
+    + '{"completionText":"a"}{"completionText":"b"}';
+  const { value } = await withFetch(response({ body }), () => converse(client()));
+  assert.strictEqual(value.text, 'ab');
+});
+
+test('padding split across chunks is still stripped', async () => {
+  const whole = `{"statusCode":200,"headers":{}}${NUL}{"completionText":"hello"}`;
+  for (const at of [31, 34, 38]) {
+    const res = {
+      ok: true,
+      status: 200,
+      headers: { get: () => 'text/event-stream' },
+      body: {
+        getReader() {
+          const parts = [whole.slice(0, at), whole.slice(at)];
+          let i = 0;
+          return {
+            async read() {
+              if (i >= parts.length) return { done: true };
+              return { done: false, value: new TextEncoder().encode(parts[i++]) };
+            },
+          };
+        },
+      },
+    };
+    const { value } = await withFetch(res, () => converse(client()));
+    assert.strictEqual(value.text, 'hello', `split at ${at}`);
+  }
+});
+
+test('stripPadding removes NUL and BOM but keeps the text', () => {
+  assert.strictEqual(stripPadding(`${NUL}{"a":1}`), '{"a":1}');
+  assert.strictEqual(stripPadding('\ufeff\n  hello'), 'hello');
+  assert.strictEqual(stripPadding('hello'), 'hello');
+});
+
+test('a genuinely plain-text stream still comes through with padding in front', async () => {
+  const { value } = await withFetch(response({ body: `${NUL}just words\n` }),
+    () => converse(client()));
+  assert.strictEqual(value.text, 'just words');
 });
 
 // --- which model actually answered -------------------------------------------

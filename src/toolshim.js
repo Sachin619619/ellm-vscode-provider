@@ -7,6 +7,8 @@
  * stream, so agent mode sees a normal tool-calling model.
  */
 
+const { parseLenient } = require('./jsonRepair');
+
 const OPEN = '<tool_call>';
 const CLOSE = '</tool_call>';
 
@@ -142,14 +144,18 @@ class ToolCallScanner {
     return { text: inCall ? OPEN + buf : buf, calls: [] };
   }
 
-  /** A tool call from raw JSON, or null if it is not one. */
+  /**
+   * A tool call from raw JSON, or null if it is not one.
+   *
+   * Repairing before giving up matters most on Windows. A model writing
+   * `{"filePath":"c:\Users\dev\notes.md"}` has produced invalid JSON - `\U` is not
+   * an escape sequence - so a strict parse throws and the call is shown to the
+   * user as text instead of being run. The file edit silently never happens, the
+   * model is told nothing, and it tries the same edit again. Every tool call
+   * carrying a Windows path fails this way.
+   */
   #toCall(raw) {
-    let parsed;
-    try {
-      parsed = JSON.parse(raw.trim());
-    } catch {
-      return null;
-    }
+    const parsed = parseLenient(raw.trim())?.value;
     if (!parsed || typeof parsed.name !== 'string') return null;
 
     return {

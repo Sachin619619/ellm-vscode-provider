@@ -35,6 +35,61 @@ test('a well-formed tagged call becomes a tool call, not text', () => {
   assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { path: 'package.json' });
 });
 
+// --- calls a strict parser throws away --------------------------------------
+// On Windows every file-path argument is invalid JSON, because the model writes
+// the path the way the OS spells it. A strict parse threw, the call was shown to
+// the user as raw text, the edit never ran, nothing told the model why, and it
+// reissued the same call. These pin the repair.
+
+test('a Windows path in the arguments does not throw the call away', () => {
+  const raw = String.raw`{"name":"replace_string_in_file","arguments":{"filePath":"c:\Users\dev\proj\docs\notes.md","oldString":"a","newString":"b"}}`;
+  const { text, calls } = scan(`<tool_call>${raw}</tool_call>`);
+
+  assert.strictEqual(text, '', 'the call leaked into the chat as text');
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].function.name, 'replace_string_in_file');
+  assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), {
+    filePath: 'c:\\Users\\dev\\proj\\docs\\notes.md',
+    oldString: 'a',
+    newString: 'b',
+  });
+});
+
+test('valid escapes inside a repaired call keep their meaning', () => {
+  // \n is a newline the model meant; \U is a backslash it did not escape. Both
+  // appear in the same argument, and the repair has to tell them apart.
+  const raw = String.raw`{"name":"edit","arguments":{"path":"c:\tmp\x.md","body":"one\ntwo\ttabbed","q":"say \"hi\""}}`;
+  const { calls } = scan(`<tool_call>${raw}</tool_call>`);
+
+  assert.strictEqual(calls.length, 1);
+  assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), {
+    path: 'c:\\tmp\\x.md',
+    body: 'one\ntwo\ttabbed',
+    q: 'say "hi"',
+  });
+});
+
+test('an unescaped newline inside an argument is repaired, not dropped', () => {
+  const raw = '{"name":"write","arguments":{"body":"line one\nline two"}}';
+  const { calls } = scan(`<tool_call>${raw}</tool_call>`);
+  assert.strictEqual(calls.length, 1);
+  assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { body: 'line one\nline two' });
+});
+
+test('an untagged bare call with a Windows path is still recognised', () => {
+  const raw = String.raw`{"name":"read_file","arguments":{"path":"c:\Users\dev\a.txt"}}`;
+  const { text, calls } = scan(raw);
+  assert.strictEqual(text, '');
+  assert.strictEqual(calls.length, 1);
+  assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { path: 'c:\\Users\\dev\\a.txt' });
+});
+
+test('repair does not turn genuine prose into a tool call', () => {
+  const { text, calls } = scan('{"name": not json at all');
+  assert.strictEqual(calls.length, 0);
+  assert.strictEqual(text, '{"name": not json at all');
+});
+
 test('a tag split across chunks never leaks a partial tag', () => {
   const whole = `Here goes: <tool_call>${CALL}</tool_call>`;
   for (const at of [12, 15, 20, 31, 60]) {
