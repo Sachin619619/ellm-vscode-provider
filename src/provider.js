@@ -1,8 +1,30 @@
 const vscode = require('vscode');
 const { CorpClient, CorpAuthError, describeConflict, describeRequest } = require('./corpClient');
 const { withContinuation } = require('./continuation');
-const { buildToolPrompt, ToolCallScanner, hasOpenToolCall } = require('./toolshim');
+const {
+  buildToolPrompt, ToolCallScanner, hasOpenToolCall, restartsToolCall, dropOpenToolCall,
+} = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
+
+/**
+ * One piece of a tool result as text.
+ *
+ * A result part is not always text: a tool that builds its result with prompt-tsx
+ * hands back a `LanguageModelPromptTsxPart` whose `value` is an object. String
+ * concatenation turns that into "[object Object]", so the model is told the tool
+ * ran and told nothing about what it found - and it reissues the same call.
+ */
+function resultPieceToText(piece) {
+  if (typeof piece === 'string') return piece;
+  const value = piece?.value;
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '';
+  }
+}
 
 /** Read a VS Code message part without depending on class identity across API versions. */
 function partToPieces(part) {
@@ -14,8 +36,8 @@ function partToPieces(part) {
   }
   if ('callId' in part && 'content' in part) {
     const content = Array.isArray(part.content)
-      ? part.content.map((c) => (typeof c === 'string' ? c : c?.value ?? '')).join('')
-      : String(part.content ?? '');
+      ? part.content.map(resultPieceToText).join('')
+      : resultPieceToText(part.content) || String(part.content ?? '');
     return { toolResult: { callId: part.callId, content } };
   }
   return {};
@@ -151,6 +173,11 @@ class EllmChatProvider {
         // backend that reports a clean stop for a capped response would otherwise
         // end the answer mid-JSON. An unclosed tool call settles it.
         needsMore: shimming ? hasOpenToolCall : undefined,
+        // ...and if the model answers "continue" by writing the call again from
+        // the top, keep the new one. Splicing it onto the abandoned half is how a
+        // file gets written with its middle duplicated.
+        restarted: shimming ? restartsToolCall : undefined,
+        dropStale: shimming ? dropOpenToolCall : undefined,
         signal: controller.signal,
         log: (m) => this.log(m),
       });
@@ -172,6 +199,10 @@ class EllmChatProvider {
 
       for await (const ev of stream) {
         if (token.isCancellationRequested) break;
+        if (ev.type === 'restart') {
+          scanner?.dropOpenCall();
+          continue;
+        }
         if (ev.type !== 'text' || !ev.text) continue;
 
         if (scanner) {

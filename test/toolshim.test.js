@@ -7,7 +7,9 @@
  */
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { ToolCallScanner, buildToolPrompt } = require('../src/toolshim');
+const {
+  ToolCallScanner, buildToolPrompt, restartsToolCall, dropOpenToolCall,
+} = require('../src/toolshim');
 
 /** Feed text through the scanner one chunk at a time, as a stream would. */
 function scan(chunks) {
@@ -138,10 +140,23 @@ test('ordinary prose passes through untouched', () => {
   assert.strictEqual(calls.length, 0);
 });
 
-test('a tagged call that is not JSON is shown so the model can self-correct', () => {
+test('a tagged call that is not JSON is reported, not dumped into the chat', () => {
   const { text, calls } = scan('<tool_call>read the file please</tool_call>');
   assert.strictEqual(calls.length, 0);
-  assert.strictEqual(text, '<tool_call>read the file please</tool_call>');
+  assert.doesNotMatch(text, /<tool_call>/, 'the markup itself must not reach the chat');
+  assert.match(text, /could not be run/);
+  // The model reads this back as its own previous turn - it has to say what to fix.
+  assert.match(text, /valid JSON/);
+  assert.match(text, /read the file please/, 'enough of the call to recognise which one');
+});
+
+test('a call cut off mid-write is reported with its length, not its body', () => {
+  const half = `<tool_call>{"name":"create_file","arguments":{"content":"${'x'.repeat(4000)}`;
+  const { text, calls } = scan(half);
+  assert.strictEqual(calls.length, 0);
+  assert.ok(text.length < 500, `a 4000-char body must not land in the chat (got ${text.length})`);
+  assert.match(text, /stopped before it finished/);
+  assert.match(text, /smaller pieces/);
 });
 
 test('text before and after a call is preserved in order', () => {
@@ -225,4 +240,37 @@ test('the tool prompt lists every tool by name', () => {
   assert.match(prompt, /read_file/);
   assert.match(prompt, /write_file/);
   assert.match(prompt, /<tool_call>/);
+});
+
+// --- a continuation that starts the call over instead of finishing it --------
+
+test('a fresh call only counts as a restart when one was left open', () => {
+  const open = '<tool_call>{"name":"create_file","arguments":{"content":"half';
+  assert.ok(restartsToolCall(open, '<tool_call>{"name":"create_file"'));
+  // Nothing outstanding: a second call after a finished one is normal, not a restart.
+  assert.strictEqual(restartsToolCall(`${open}"}}</tool_call>`, '<tool_call>{"name":"x"}'), false);
+  // The honest case - the continuation really does carry on mid-JSON.
+  assert.strictEqual(restartsToolCall(open, ' of the file"}}</tool_call>'), false);
+  // A closing tag before the next opening one means it finished this call first.
+  assert.strictEqual(restartsToolCall(open, '"}}</tool_call> and <tool_call>{"name":"y"}'), false);
+});
+
+test('dropping the open call leaves the text before it untouched', () => {
+  const text = 'Writing the file now.\n<tool_call>{"name":"create_file","arguments":{"co';
+  assert.strictEqual(dropOpenToolCall(text), 'Writing the file now.\n');
+  assert.strictEqual(dropOpenToolCall('no call here'), 'no call here');
+});
+
+test('the scanner forgets an abandoned call instead of splicing it onto the new one', () => {
+  const scanner = new ToolCallScanner();
+  scanner.push('<tool_call>{"name":"create_file","arguments":{"filePath":"a.py","content":"firs');
+  scanner.dropOpenCall();
+
+  const out = scanner.push(
+    '<tool_call>{"name":"create_file","arguments":{"filePath":"a.py","content":"first half\\nsecond half\\n"}}</tool_call>',
+  );
+  assert.strictEqual(out.calls.length, 1);
+  const args = JSON.parse(out.calls[0].function.arguments);
+  assert.strictEqual(args.content, 'first half\nsecond half\n', 'no duplicated fragment');
+  assert.deepStrictEqual(scanner.flush(), { text: '', calls: [] });
 });

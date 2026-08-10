@@ -23,7 +23,7 @@ so your models appear in the normal model picker next to everything else.
 Grab the `.vsix` from [Releases](../../releases) and:
 
 ```bash
-code --install-extension ellm-provider-0.2.5.vsix
+code --install-extension ellm-provider-0.3.2.vsix
 ```
 
 Requires VS Code 1.104 or newer.
@@ -155,7 +155,17 @@ call actually arrives:
 - a **mangled closing tag** (`</tool_call}`, or none at all) is still parsed as a call rather
   than dumped on the user as raw markup
 - a **bare, untagged** `{"name": …, "arguments": …}` answer is recognised as the call it is
-- genuinely malformed JSON inside the tags *is* shown as text, so the model can self-correct
+- a **file body written with unescaped quotes** — a Python `"""docstring"""`, a Windows path —
+  is repaired rather than thrown away (see [`src/jsonRepair.js`](src/jsonRepair.js))
+- a call the model **restarted** instead of continuing replaces the half it walked away from,
+  rather than being spliced onto it — that splice is how a written file ends up with its
+  middle duplicated
+- a call that still will not parse is **not** dumped into the chat as raw markup. Tool calls
+  routinely carry a whole source file, and a chat full of that markup buries the answer while
+  telling you nothing. One line goes to the chat instead — addressed to the model as much as
+  to you, since VS Code replays it as the previous assistant turn, so it is the model's only
+  chance to learn the call never ran — and the reason, with the length and the brace balance,
+  goes to the *Enterprise LLM* output channel as `TOOL CALL PROBLEM:`
 
 ## “Token rejected by the enterprise LLM”
 

@@ -75,6 +75,11 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
   const maxRounds = opts.maxContinuations ?? 8;
   const log = opts.log ?? (() => {});
   const signal = opts.signal;
+  // Optional, and only meaningful together: `restarted(full, next)` says the
+  // continuation began the outstanding call again from the top, `dropStale(full)`
+  // removes the half it walked away from.
+  const restarted = opts.dropStale ? opts.restarted : undefined;
+  const dropStale = opts.dropStale ?? ((text) => text);
 
   let full = '';
   let round = 0;
@@ -83,6 +88,7 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
   for (;;) {
     const base = full;
     let rawLength = 0;
+    let produced = false;
     let finish;
     // Round 0 streams straight through; later rounds buffer a head window to de-dup.
     let head = round === 0 ? null : '';
@@ -107,26 +113,44 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
         const cleaned = stripOverlap(base, stripPreamble(head, insideFence(base)));
         head = null;
         if (cleaned) {
+          // The model may answer "continue" by starting the whole thing again.
+          // Keep the restart and throw away the half it abandoned, here and in
+          // the consumer, rather than stitching two overlapping halves together.
+          if (restarted?.(full, cleaned)) {
+            full = dropStale(full);
+            log('the model restarted the tool call instead of continuing it; '
+              + 'dropped the unfinished half');
+            yield { type: 'restart' };
+          }
           full += cleaned;
+          produced = true;
           yield { type: 'text', text: cleaned };
         }
         continue;
       }
 
       full += ev.text;
+      produced = true;
       yield { type: 'text', text: ev.text };
     }
 
     if (head !== null && head) {
       const cleaned = stripOverlap(base, stripPreamble(head, insideFence(base)));
       if (cleaned) {
+        if (restarted?.(full, cleaned)) {
+          full = dropStale(full);
+          log('the model restarted the tool call instead of continuing it; '
+            + 'dropped the unfinished half');
+          yield { type: 'restart' };
+        }
         full += cleaned;
+        produced = true;
         yield { type: 'text', text: cleaned };
       }
     }
 
     // A continuation that added nothing means there is no more to say.
-    if (round > 0 && full.length === base.length) break;
+    if (round > 0 && !produced) break;
 
     // Trust an explicit stop reason; only measure length when told nothing.
     const truncated = finish === 'length'

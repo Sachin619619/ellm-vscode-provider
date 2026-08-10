@@ -97,3 +97,86 @@ test('hasOpenToolCall only reports a call that was never closed', () => {
   assert.strictEqual(hasOpenToolCall('<tool_call>{"a":1'), true);
   assert.strictEqual(hasOpenToolCall('<tool_call>{}</tool_call> then <tool_call>{"b"'), true);
 });
+
+// --- when "continue" is answered by starting over ----------------------------
+
+const { restartsToolCall, dropOpenToolCall, ToolCallScanner } = require('../src/toolshim');
+
+/** Consume the stream the way the provider does, honouring the restart event. */
+async function drainAsProvider(stream) {
+  const scanner = new ToolCallScanner();
+  let text = '';
+  const calls = [];
+  let restarts = 0;
+
+  for await (const ev of stream) {
+    if (ev.type === 'restart') {
+      restarts++;
+      scanner.dropOpenCall();
+      continue;
+    }
+    if (ev.type !== 'text') continue;
+    const out = scanner.push(ev.text);
+    text += out.text;
+    calls.push(...out.calls);
+  }
+  const rest = scanner.flush();
+  return { text: text + rest.text, calls: calls.concat(rest.calls), restarts };
+}
+
+/**
+ * The realistic shape: the half already written is longer than the de-dup window,
+ * so the overlap stripper cannot see that the restart repeats it. (When the model
+ * repeats a *short* half verbatim, stripOverlap stitches it and there is nothing
+ * to restart.)
+ */
+const BODY = 'print(1)\\n'.repeat(70);
+const HALF = `<tool_call>{"name":"create_file","arguments":{"filePath":"a.py","content":"${BODY}`;
+const WHOLE = `<tool_call>{"name":"create_file","arguments":{"filePath":"a.py","content":"${BODY}print(2)\\n"}}</tool_call>`;
+
+test('a restarted tool call replaces the half it abandoned', async () => {
+  // Cut off mid-argument, and the backend calls it a clean stop; asked to
+  // continue, the model writes the whole call again instead.
+  const up = upstream([{ text: HALF, finish: 'stop' }, { text: WHOLE, finish: 'stop' }]);
+
+  const out = await drainAsProvider(withContinuation(up.call, [], {
+    needsMore: hasOpenToolCall, restarted: restartsToolCall, dropStale: dropOpenToolCall,
+  }));
+
+  assert.strictEqual(out.restarts, 1);
+  assert.strictEqual(out.calls.length, 1, 'one call, not two halves of one');
+  assert.strictEqual(
+    JSON.parse(out.calls[0].function.arguments).content,
+    'print(1)\n'.repeat(70) + 'print(2)\n',
+    'the abandoned fragment must not be spliced into the file',
+  );
+  assert.strictEqual(out.text, '', 'no markup in the chat');
+});
+
+test('an honest continuation is not mistaken for a restart', async () => {
+  const up = upstream([
+    { text: '<tool_call>{"name":"create_file","arguments":{"filePath":"a.py","content":"one\\n', finish: 'length' },
+    { text: 'two\\n"}}</tool_call>', finish: 'stop' },
+  ]);
+
+  const out = await drainAsProvider(withContinuation(up.call, [], {
+    needsMore: hasOpenToolCall, restarted: restartsToolCall, dropStale: dropOpenToolCall,
+  }));
+
+  assert.strictEqual(out.restarts, 0);
+  assert.strictEqual(out.calls.length, 1);
+  assert.strictEqual(JSON.parse(out.calls[0].function.arguments).content, 'one\ntwo\n');
+});
+
+test('the restart hooks stay off unless both are supplied', async () => {
+  const up = upstream([
+    { text: '<tool_call>{"name":"x","arguments":{"a":"1', finish: 'stop' },
+    { text: '<tool_call>{"name":"x","arguments":{"a":"1"}}</tool_call>', finish: 'stop' },
+  ]);
+
+  // restarted without dropStale would trim nothing while claiming a restart.
+  const out = await drainAsProvider(withContinuation(up.call, [], {
+    needsMore: hasOpenToolCall, restarted: restartsToolCall,
+  }));
+  assert.strictEqual(out.restarts, 0);
+});

@@ -75,6 +75,49 @@ function hasOpenToolCall(text) {
   return open !== -1 && text.indexOf(CLOSE, open) === -1;
 }
 
+/**
+ * Whether a continuation round abandoned the call it was meant to finish and
+ * started a fresh one.
+ *
+ * Asked to continue mid-JSON, a model often re-opens `<tool_call>` and writes the
+ * whole call again from the top. Stitching that onto the half it already wrote
+ * produces one call made of two overlapping halves - which either fails to parse
+ * or, worse, parses into a file with duplicated content. The restarted call is
+ * the self-consistent one, so the half before it has to go.
+ */
+function restartsToolCall(base, next) {
+  if (!hasOpenToolCall(base)) return false;
+  const open = next.indexOf(OPEN);
+  if (open === -1) return false;
+  const close = next.indexOf(CLOSE);
+  return close === -1 || close > open;
+}
+
+/** `text` with the unfinished tool call at its end removed. */
+function dropOpenToolCall(text) {
+  const open = text.lastIndexOf(OPEN);
+  return open === -1 ? text : text.slice(0, open);
+}
+
+/**
+ * What the chat shows in place of a tool call that could not be run.
+ *
+ * Not the call itself: it is routinely a whole source file, and a chat window
+ * full of raw markup tells the user nothing while burying the answer. It is
+ * addressed to the model as much as to the user - VS Code replays this text as
+ * the previous assistant turn, so it is also the only chance the model gets to
+ * find out the call never ran and write it differently.
+ */
+function unparsedNotice(raw, closed) {
+  const head = raw.slice(0, 160).replace(/\s+/g, ' ').trim();
+  return `\n\n**A tool call could not be run** - ${closed
+    ? 'its arguments were not valid JSON'
+    : `it stopped before it finished (${raw.length} chars)`}, so nothing was `
+    + 'written or read. Send it again as a single valid JSON object: escape every `"` as '
+    + '`\\"` and every `\\` as `\\\\` inside strings, and if it carries a large file, write '
+    + `it in smaller pieces.\n\n> starts: \`${head}\`\n\n`;
+}
+
 /** How many trailing chars of `buf` could be the start of `tag`. */
 function partialTagTail(buf, tag) {
   for (let i = Math.min(buf.length, tag.length - 1); i > 0; i--) {
@@ -134,10 +177,10 @@ class ToolCallScanner {
         const call = this.#toCall(raw);
         if (call) calls.push(call);
         else {
-          // Malformed call - surface it as text so the model can self-correct,
-          // and say so in the log, where the reason is actually readable.
+          // Malformed call - tell the model it never ran so it can self-correct,
+          // and put the reason in the log, where it is actually readable.
           this.#reportUnparsed(raw, true);
-          text += `${OPEN}${raw}${CLOSE}`;
+          text += unparsedNotice(raw, true);
         }
         continue;
       }
@@ -189,7 +232,19 @@ class ToolCallScanner {
     // A call still open at end of stream was cut off rather than mis-written -
     // the upstream response cap lands mid-JSON on any sizeable file.
     if (inCall) this.#reportUnparsed(buf, false);
-    return { text: inCall ? OPEN + buf : buf, calls: [] };
+    return { text: inCall ? unparsedNotice(buf, false) : buf, calls: [] };
+  }
+
+  /**
+   * Forget the call currently being written, without emitting it.
+   *
+   * Used when the model restarts a call it left half-finished: the half in the
+   * buffer is dead weight that would otherwise be spliced onto the new one.
+   */
+  dropOpenCall() {
+    if (!this.#inCall) return;
+    this.#buf = '';
+    this.#inCall = false;
   }
 
   /**
@@ -218,4 +273,12 @@ class ToolCallScanner {
   }
 }
 
-module.exports = { buildToolPrompt, injectToolPrompt, ToolCallScanner, hasOpenToolCall };
+module.exports = {
+  buildToolPrompt,
+  injectToolPrompt,
+  ToolCallScanner,
+  hasOpenToolCall,
+  restartsToolCall,
+  dropOpenToolCall,
+  unparsedNotice,
+};
