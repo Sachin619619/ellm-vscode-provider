@@ -8,7 +8,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const {
-  ToolCallScanner, buildToolPrompt, budgetFor, restartsToolCall, dropOpenToolCall,
+  ToolCallScanner, buildToolPrompt, buildToolReminder, budgetFor, restartsToolCall,
+  dropOpenToolCall,
 } = require('../src/toolshim');
 
 /** Feed text through the scanner one chunk at a time, as a stream would. */
@@ -318,14 +319,33 @@ test('without Required the model may still answer in prose', () => {
  * tool when it should simply answer.
  */
 /**
- * The protocol sits second to last, so the request FOLLOWS it. It used to say
- * "above", which pointed the model back over its own tool schemas - and on a prompt
- * the backend had truncated from the front, at nothing at all.
+ * The schemas sit at the front and must not claim which message is the request. Two
+ * releases were lost to exactly that claim: "the request is above" (it had been
+ * truncated away) and "the request is the message that follows" (in an agent round
+ * the next message is a tool result, so the model answered the protocol instead).
  */
-test('the tool prompt ends by pointing forward at the request', () => {
+test('the schema block never claims which message is the request', () => {
   const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
-  assert.match(prompt.trim().split('\n').pop(), /message that follows is the request/i);
+  assert.match(prompt.trim().split('\n').pop(), /conversation follows/i);
   assert.doesNotMatch(prompt, /request above/i);
+  assert.doesNotMatch(prompt, /message that follows is the request/i);
+});
+
+/**
+ * The anchor goes last, so it has to stay small: being large is precisely what made
+ * the full protocol unusable in that position.
+ */
+test('the trailing reminder is small enough to displace nothing', () => {
+  const reminder = buildToolReminder({ budgetChars: 4500 });
+  assert.ok(reminder.length < 400, `reminder is ${reminder.length} chars`);
+  assert.match(reminder, /<tool_call>/);
+  assert.match(reminder, /under 4500 characters/);
+  assert.match(reminder, /most recent request/i);
+});
+
+test('the reminder carries the Required mode through to the last thing read', () => {
+  assert.match(buildToolReminder({ required: true }), /Do not answer in prose/i);
+  assert.doesNotMatch(buildToolReminder({}), /Do not answer in prose/i);
 });
 
 /**

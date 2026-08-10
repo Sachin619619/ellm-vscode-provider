@@ -2,8 +2,8 @@ const vscode = require('vscode');
 const { CorpClient, CorpAuthError, describeConflict, describeRequest } = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const {
-  buildToolPrompt, budgetFor, ToolCallScanner, hasOpenToolCall, restartsToolCall,
-  dropOpenToolCall,
+  buildToolPrompt, buildToolReminder, budgetFor, ToolCallScanner, hasOpenToolCall,
+  restartsToolCall, dropOpenToolCall,
 } = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
 
@@ -169,31 +169,35 @@ class EllmChatProvider {
     const budget = budgetFor(cap);
 
     const turns = this.toTurns(messages, shimming);
-    // Second to last, not last, and not first.
+    // Split in two, because the protocol was never one thing.
     //
-    // First (before v0.4.0) put the protocol behind the whole conversation, so the
-    // rules for the tags were thousands of characters from where the model started
-    // writing, and malformed calls were routine. Last fixed that and broke something
-    // worse: the protocol runs to ~12k chars with a real tool list, so it pushed the
-    // request to the very front of the prompt - which is the end the backend truncates.
-    // The model got a tool manual ending in "answer the most recent request above"
-    // with nothing above it, and said, correctly, that it saw no request.
+    // The schemas are bulky and only need to be present, so they go first, where their
+    // ~12k characters displace nothing. The few rules that shape the next few hundred
+    // characters go last, where they anchor the writing and are far too small to push
+    // anything off the front of a front-truncating backend.
     //
-    // Here it keeps the anchoring - it still sits right beside where writing starts,
-    // after every TOOL RESULT turn - while the request stays last, both for the model
-    // and for anything downstream that trims from the front.
+    // Both previous arrangements assumed something about position and were wrong.
+    // Nothing here names which turn is the request: in an agent round the last turn is
+    // a TOOL RESULT and the request is further up, so any such claim is wrong half the
+    // time - which is how v0.4.3 ended up answering the protocol instead of the user.
     if (shimming) {
-      const protocol = {
+      turns.unshift({
         speaker: 'system',
         utterance: buildToolPrompt(tools, { required, budgetChars: budget }),
-      };
-      if (turns.length) turns.splice(turns.length - 1, 0, protocol);
-      else turns.push(protocol);
+      });
+      turns.push({
+        speaker: 'system',
+        utterance: buildToolReminder({ budgetChars: budget, required }),
+      });
     }
     if (shimming) {
       this.log(`${tools.length} tool(s) offered${required ? ', tool call REQUIRED' : ''}`
         + `, reply budget ${budget} chars (cap ${cap})`);
     }
+    // The shape of the prompt, not its content. Two releases were spent guessing which
+    // turn held the request and both guesses were wrong; this is the line that would
+    // have shown it. Speakers and sizes only - the text itself is the user's code.
+    this.log(`turns: ${turns.map((t) => `${t.speaker}(${String(t.utterance ?? '').length})`).join(' ')}`);
 
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());

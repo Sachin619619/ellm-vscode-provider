@@ -114,14 +114,42 @@ function buildToolPrompt(tools, { required = false, budgetChars = 0 } = {}) {
       ? '- You MUST call a tool in this reply. Do not answer in prose.'
       : '- If no tool is needed, just answer normally in plain text.',
     '',
-    // The protocol is inserted second to last, so the request follows it rather than
-    // preceding it. Pointing the model "above" from here sent it looking at the tool
-    // schemas - and on a truncated prompt, at nothing at all.
-    required
-      ? 'The message that follows is the request. Call the tool it needs.'
-      : 'The message that follows is the request. Answer it, calling tools only if '
-      + 'they are needed.',
+    // The protocol sits at the FRONT, so the conversation follows it. It must not
+    // claim the request is the very next message: in an agent round the next thing
+    // is a tool result, and the request is further down.
+    'The conversation follows. Everything above is protocol, not a request.',
   ].join('\n');
+}
+
+/**
+ * The short anchor that goes LAST, after the whole conversation.
+ *
+ * Two positions have now been tried for the full protocol and both failed. At the
+ * front, the tag rules were thousands of characters from where the model started
+ * writing and calls came back malformed. At the back, the protocol is ~12k characters
+ * with a real tool list, so it displaced the request - first off the front of a
+ * front-truncating backend, then, once the request was kept last, into a shape where
+ * the model answered the protocol instead of the question.
+ *
+ * The mistake was treating it as one block that had to be somewhere. The schemas are
+ * bulky and only need to be present; the rules that shape the next few hundred
+ * characters are what needs to be near the writing. So the schemas go first, where
+ * they displace nothing, and this goes last, where it is small enough to displace
+ * nothing either.
+ *
+ * It must not name which message is the request. In an agent round the last turn is a
+ * tool result, and any claim about position is wrong half the time - which is exactly
+ * how the last two versions broke.
+ */
+function buildToolReminder({ budgetChars = 0, required = false } = {}) {
+  return [
+    `Reminder: to call a tool, emit ${OPEN}{"name": "...", "arguments": {...}}${CLOSE} - `
+    + 'valid JSON, quotes and backslashes escaped, never inside a code fence.',
+    budgetChars ? `Keep this reply under ${budgetChars} characters.` : '',
+    required
+      ? 'Answer the user\'s most recent request by calling a tool. Do not answer in prose.'
+      : 'Now answer the user\'s most recent request, calling tools only if they are needed.',
+  ].filter(Boolean).join('\n');
 }
 
 /**
@@ -335,6 +363,7 @@ class ToolCallScanner {
 
 module.exports = {
   buildToolPrompt,
+  buildToolReminder,
   budgetFor,
   ToolCallScanner,
   hasOpenToolCall,

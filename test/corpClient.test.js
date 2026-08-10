@@ -937,3 +937,30 @@ test('a zero or missing budget disables trimming', () => {
   assert.strictEqual(fitTurns(turns, 0, {}), turns);
   assert.strictEqual(fitTurns(turns, undefined, {}), turns);
 });
+
+/**
+ * Once a system reminder is appended after the conversation, "the last turn" is the
+ * reminder - not the request. Protecting only the last turn kept the reminder and
+ * dropped the question it referred to.
+ */
+test('trimming pins the schemas, the request, and the trailing reminder', () => {
+  const big = (n, who) => ({ speaker: who, utterance: 'x'.repeat(n) });
+  const turns = [
+    { speaker: 'system', utterance: 'TOOL SCHEMAS' },
+    big(400, 'human'), big(400, 'assistant'), big(400, 'human'), big(400, 'assistant'),
+    { speaker: 'human', utterance: 'THE ACTUAL REQUEST' },
+    { speaker: 'system', utterance: 'REMINDER' },
+  ];
+  const kept = fitTurns(turns, 900, {});
+  const text = kept.map((t) => t.utterance).join('|');
+
+  assert.match(text, /TOOL SCHEMAS/);
+  assert.match(text, /THE ACTUAL REQUEST/);
+  assert.match(text, /REMINDER/);
+  assert.match(text, /earlier conversation omitted/);
+  assert.ok(kept.length < turns.length, 'history was dropped');
+  // Order has to survive too: schemas first, reminder last.
+  assert.strictEqual(kept[0].utterance, 'TOOL SCHEMAS');
+  assert.strictEqual(kept[kept.length - 1].utterance, 'REMINDER');
+  assert.strictEqual(kept[kept.length - 2].utterance, 'THE ACTUAL REQUEST');
+});

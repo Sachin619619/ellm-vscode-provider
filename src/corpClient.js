@@ -473,13 +473,23 @@ function fitTurns(turns, budget, { onTrim } = {}) {
   const total = (list) => list.reduce((n, t) => n + size(t), 0);
   if (total(turns) <= budget) return turns;
 
-  // Anything the model must still be holding when it starts writing.
-  const keepFrom = turns.length - (turns[turns.length - 2]?.speaker === 'system' ? 2 : 1);
-  const protectedTurns = turns.slice(keepFrom);
-  const history = turns.slice(0, keepFrom);
+  // The instructions the provider wraps the conversation in: a leading block of tool
+  // schemas and a trailing reminder, both system turns. Neither is history and neither
+  // may be dropped - losing the schemas breaks every tool call.
+  let head = 0;
+  while (head < turns.length && turns[head].speaker === 'system') head++;
+  let tail = turns.length;
+  while (tail > head && turns[tail - 1].speaker === 'system') tail--;
+
+  // ...plus the last real turn, which is the request itself. Protecting "the last
+  // turn" was not enough once a system reminder was appended after it: the reminder
+  // was kept and the question it referred to was dropped.
+  const request = tail > head ? tail - 1 : head;
+  const pinned = [...turns.slice(0, head), ...turns.slice(request, tail), ...turns.slice(tail)];
+  const history = turns.slice(head, request);
 
   // Newest history first, so what survives is what was said most recently.
-  const room = budget - total(protectedTurns) - OMITTED_NOTE.length - 12;
+  const room = budget - total(pinned) - OMITTED_NOTE.length - 12;
   const kept = [];
   let used = 0;
   for (let i = history.length - 1; i >= 0; i--) {
@@ -491,13 +501,18 @@ function fitTurns(turns, budget, { onTrim } = {}) {
 
   const dropped = history.length - kept.length;
   if (dropped > 0) {
-    onTrim?.(`prompt over ${budget} chars - dropped ${dropped} of ${turns.length} turn(s). `
-      + 'Lower ellm.contextChars if the backend still truncates, raise it if this is cutting '
-      + 'useful history.');
-    // A protected pair alone can still exceed the budget - one huge file in the last
-    // turn. Nothing can be dropped then without losing the request, so it goes as is
-    // and the note above is the only warning there will be.
-    return [{ speaker: 'system', utterance: OMITTED_NOTE }, ...kept, ...protectedTurns];
+    onTrim?.(`prompt over ${budget} chars - dropped ${dropped} of ${history.length} history `
+      + 'turn(s). Lower ellm.contextChars if the backend still truncates, raise it if this is '
+      + 'cutting useful history.');
+    // The pinned turns alone can still exceed the budget - one huge file in the
+    // request. Nothing more can go without losing the request itself, so it is sent
+    // whole and the line above is the only warning there will be.
+    return [
+      ...turns.slice(0, head),
+      { speaker: 'system', utterance: OMITTED_NOTE },
+      ...kept,
+      ...turns.slice(request, turns.length),
+    ];
   }
   return turns;
 }
