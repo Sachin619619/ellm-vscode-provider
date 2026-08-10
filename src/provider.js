@@ -7,6 +7,22 @@ const {
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
 
 /**
+ * Characters per token, for both the advertised budget and the count VS Code asks
+ * for. It has to be ONE constant used in both places: VS Code packs context until
+ * `provideTokenCount` stops fitting under `maxInputTokens`, so with the same
+ * divisor on each side the value cancels and the real limit is exactly the
+ * configured character budget. Two different divisors, and the budget silently
+ * becomes something nobody chose.
+ *
+ * 3.2 rather than the usual prose figure of 4: this model's context is mostly
+ * source code and JSON tool schemas, which tokenize worse than English, and
+ * over-estimating costs a little unused context while under-estimating overruns
+ * the backend - where the truncation happens at the FRONT, taking the tool
+ * definitions with it.
+ */
+const CHARS_PER_TOKEN = 3.2;
+
+/**
  * One piece of a tool result as text.
  *
  * A result part is not always text: a tool that builds its result with prompt-tsx
@@ -78,6 +94,11 @@ class EllmChatProvider {
       textPath: readSetting(this.context, 'textPath', ''),
       servedModelPath: readSetting(this.context, 'servedModelPath', ''),
       maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
+      // How much the backend will accept in one prompt. There is no discovery
+      // endpoint to ask, so it is configuration like everything else the backend
+      // decides - and it was the one such value left hardcoded, which meant the
+      // number VS Code packs context up to was a guess nobody could correct.
+      contextChars: readSetting(this.context, 'contextChars', 400000),
       // Identity and tuning are private to this machine - see storage.js.
       identity: getPrivate(this.context, 'identity', {}),
       params: getPrivate(this.context, 'params', {}),
@@ -107,7 +128,7 @@ class EllmChatProvider {
         // id where the model name belongs.
         family: m.alias,
         version: '1.0.0',
-        maxInputTokens: Math.floor((m.contextChars ?? 400000) / 4),
+        maxInputTokens: Math.floor((m.contextChars ?? 400000) / CHARS_PER_TOKEN),
         // Deliberately far above the upstream's per-response cap: the continuation
         // layer stitches capped rounds into one answer.
         maxOutputTokens: 32000,
@@ -133,9 +154,23 @@ class EllmChatProvider {
       parameters: t.inputSchema ?? { type: 'object', properties: {} },
     }));
     const shimming = tools.length > 0;
+    // Required means the caller is waiting for a call and cannot use prose. It was
+    // read nowhere before, so those requests were answered in words and the flow
+    // that asked stalled.
+    const Mode = vscode.LanguageModelChatToolMode;
+    const required = shimming && Mode?.Required !== undefined
+      && options?.toolMode === Mode.Required;
 
     const turns = this.toTurns(messages, shimming);
-    if (shimming) turns.unshift({ speaker: 'system', utterance: buildToolPrompt(tools) });
+    // Appended, not prepended. The protocol used to open the prompt, which put it
+    // behind the whole conversation - by the time the model was writing, the rules
+    // for the tags it had to emit were thousands of characters back, and malformed
+    // calls were the routine result. Last position is also after every TOOL RESULT
+    // turn, so it re-anchors itself on each round of an agent loop.
+    if (shimming) {
+      turns.push({ speaker: 'system', utterance: buildToolPrompt(tools, { required }) });
+    }
+    if (shimming) this.log(`${tools.length} tool(s) offered${required ? ', tool call REQUIRED' : ''}`);
 
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());
@@ -164,6 +199,9 @@ class EllmChatProvider {
         // log is the only place it exists. Without this line a recovered or
         // dropped frame would be invisible.
         onFrameProblem: (msg) => this.log(`frame problem: ${msg}`),
+        // A retry is invisible to the user by design, so the log is the only place
+        // a flaky gateway shows up as flaky rather than as a slow model.
+        onRetry: (msg) => this.log(`retrying: ${msg}`),
       });
 
       const stream = withContinuation(rounds, turns, {
@@ -349,7 +387,7 @@ class EllmChatProvider {
     const str = typeof text === 'string'
       ? text
       : (text?.content ?? []).map((p) => partToPieces(p).text ?? '').join('');
-    return Math.ceil(str.length / 4);
+    return Math.ceil(str.length / CHARS_PER_TOKEN);
   }
 }
 

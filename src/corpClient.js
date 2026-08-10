@@ -37,6 +37,29 @@ function stripPadding(text) {
   return text.replace(PADDING, '');
 }
 
+/**
+ * Statuses that mean "busy or briefly broken", not "wrong".
+ *
+ * A gateway in front of a shared model returns these routinely under load. Every
+ * one of them used to end the turn: the error propagated out of the provider and
+ * VS Code showed a failed request, mid-agent-loop, with whatever work was in
+ * flight lost. The client is free to retry because nothing has been streamed yet -
+ * see `fetchWithRetry`, which deliberately only guards the opening request.
+ */
+const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRY_ATTEMPTS = 2;
+const RETRY_BASE_MS = 600;
+
+/** `Retry-After` in ms, seconds or HTTP-date, or null when it says nothing usable. */
+function retryAfterMs(res) {
+  const raw = res.headers?.get?.('retry-after');
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(raw);
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
 const DEFAULT_AUTH_HEADER = 'X-Corp-Auth';
 const DEFAULT_CHAT_PATH = '/chat';
 const DEFAULT_PROMPT_FIELD = 'prompt';
@@ -410,7 +433,7 @@ class CorpClient {
   constructor({
     url, token, authHeader, authPrefix, cookie, chatPath, promptField, modelField,
     model, models, identity, params, textPath, servedModelPath,
-    contextChars, maxResponseChars,
+    contextChars, maxResponseChars, retryBaseMs,
   } = {}) {
     // Which body key carries the prompt is the backend's business, not this file's.
     this.promptField = promptField || DEFAULT_PROMPT_FIELD;
@@ -432,6 +455,8 @@ class CorpClient {
     this.servedModelPath = servedModelPath || '';
     this.contextChars = contextChars || 400000;
     this.maxResponseChars = maxResponseChars || 5000;
+    // Only the tests set this, so a retry test does not spend real seconds asleep.
+    this.retryBaseMs = retryBaseMs ?? RETRY_BASE_MS;
   }
 
   get configured() {
@@ -517,18 +542,66 @@ class CorpClient {
     };
   }
 
-  /** Yields { type:'text', text } then a final { type:'finish', reason }. */
-  async *converse({
-    modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest,
-  }) {
+  /**
+   * The opening request, retried while it is still safe to retry.
+   *
+   * Only the request BEFORE the first byte is replayable: once frames have been
+   * yielded, the consumer has already streamed them into the chat and a second
+   * attempt would duplicate them. So this returns the response and never touches
+   * the stream - a mid-stream failure stays fatal, correctly.
+   */
+  async fetchWithRetry({ modelAlias, turns, signal, onRetry }) {
     const url = this.endpoint;
-    if (onRequest) onRequest(this.requestShape({ modelAlias, turns }));
-    const res = await fetch(url, {
+    const init = {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(this.body({ modelAlias, turns })),
       signal,
-    });
+    };
+
+    let lastError;
+    for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        // Exponential, with jitter so several requests do not retry in lockstep.
+        const wait = lastError?.retryAfter
+          ?? this.retryBaseMs * (2 ** (attempt - 1)) * (1 + Math.random());
+        onRetry?.(`${lastError?.why ?? 'request failed'} - retrying in ${Math.round(wait)}ms `
+          + `(attempt ${attempt + 1} of ${RETRY_ATTEMPTS + 1})`);
+        await new Promise((resolve) => { setTimeout(resolve, wait); });
+        if (signal?.aborted) throw new Error('Request cancelled.');
+      }
+
+      let res;
+      try {
+        res = await fetch(url, init);
+      } catch (err) {
+        // A cancelled request is not a failed one - never retry it.
+        if (signal?.aborted || err?.name === 'AbortError') throw err;
+        lastError = { why: `could not reach ${url} (${err.message})`, error: err };
+        if (attempt === RETRY_ATTEMPTS) throw err;
+        continue;
+      }
+
+      if (res.ok || !RETRY_STATUS.has(res.status)) return res;
+      if (attempt === RETRY_ATTEMPTS) return res;
+      lastError = {
+        why: `${url} answered ${res.status}`,
+        retryAfter: retryAfterMs(res),
+      };
+      // The body is not needed, but leaving it unread keeps the socket busy.
+      try { await res.arrayBuffer(); } catch { /* nothing to drain */ }
+    }
+
+    throw lastError?.error ?? new Error(`${url} could not be reached.`);
+  }
+
+  /** Yields { type:'text', text } then a final { type:'finish', reason }. */
+  async *converse({
+    modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest, onRetry,
+  }) {
+    const url = this.endpoint;
+    if (onRequest) onRequest(this.requestShape({ modelAlias, turns }));
+    const res = await this.fetchWithRetry({ modelAlias, turns, signal, onRetry });
 
     if (!res.ok) throw await failureFor(res, url, this);
     if (!res.body) throw new Error(`${url} answered ${res.status} with no body to stream.`);
@@ -708,6 +781,6 @@ class CorpClient {
 
 module.exports = {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding, isTransportEnvelope,
+  salvageText, stripPadding, isTransportEnvelope, retryAfterMs,
   modelFieldConflicts, describeConflict, normalizeModel, describeRequest,
 };

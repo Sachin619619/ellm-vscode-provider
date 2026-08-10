@@ -180,3 +180,47 @@ test('the restart hooks stay off unless both are supplied', async () => {
   }));
   assert.strictEqual(out.restarts, 0);
 });
+
+// --- which continuation request gets sent ------------------------------------
+
+/** The instruction sent on the continuation round, from the turns the fake saw. */
+function instructionOn(seen, round) {
+  return seen[round][seen[round].length - 1].utterance;
+}
+
+/**
+ * A model stranded mid-JSON reads "resume mid-word" as advice about writing, tidies
+ * up, and starts the call again from the top. That restart is the corruption
+ * restartsToolCall exists to clean up after - and the cleanup still costs the
+ * abandoned half plus a round trip. Naming the situation avoids most of them.
+ */
+test('an answer cut off inside a tool call is asked to continue the JSON', async () => {
+  const up = upstream([
+    { text: '<tool_call>{"name":"create_file","arguments":{"content":"half', finish: 'stop' },
+    { text: ' written"}}</tool_call>', finish: 'stop' },
+  ]);
+  await drain(withContinuation(up.call, [{ speaker: 'human', utterance: 'write it' }], {
+    maxResponseChars: 0,
+    needsMore: hasOpenToolCall,
+  }));
+
+  const instruction = instructionOn(up.seen, 1);
+  assert.match(instruction, /stopped in the middle of a tool call/i);
+  assert.match(instruction, /do NOT start the tool call again/i);
+  assert.doesNotMatch(instruction, /resume mid-word/i);
+});
+
+test('an answer cut off in prose still gets the prose instruction', async () => {
+  const up = upstream([
+    { text: 'The first half of the sentence', finish: 'length' },
+    { text: ' and the second.', finish: 'stop' },
+  ]);
+  await drain(withContinuation(up.call, [{ speaker: 'human', utterance: 'explain' }], {
+    maxResponseChars: 30,
+    needsMore: hasOpenToolCall,
+  }));
+
+  const instruction = instructionOn(up.seen, 1);
+  assert.match(instruction, /resume mid-word/i);
+  assert.doesNotMatch(instruction, /middle of a tool call/i);
+});

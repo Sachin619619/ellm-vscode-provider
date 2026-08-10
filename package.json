@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -60,6 +60,11 @@
           "type": "number",
           "default": 5000,
           "description": "Hard per-response character cap the upstream enforces. Responses that hit it are automatically continued and stitched. 0 disables continuation."
+        },
+        "ellm.contextChars": {
+          "type": "number",
+          "default": 400000,
+          "markdownDescription": "How many characters of prompt the backend accepts in one request. This is what the model advertises to VS Code as its context window, and VS Code fills it — so if it is set higher than the backend allows, the backend truncates, and it truncates the START of the prompt, where the tool definitions are. There is no discovery endpoint, so this cannot be detected: lower it if long conversations start ignoring tools."
         },
         "ellm.maxContinuations": {
           "type": "number",

@@ -274,3 +274,50 @@ test('the scanner forgets an abandoned call instead of splicing it onto the new 
   assert.strictEqual(args.content, 'first half\nsecond half\n', 'no duplicated fragment');
   assert.deepStrictEqual(scanner.flush(), { text: '', calls: [] });
 });
+
+// --- what the prompt asks for -----------------------------------------------
+
+/**
+ * Serialising every call cost a full round trip each - through a capped, stitched
+ * transport - and that is most of why a task took many more turns here than on a
+ * model with native tool calling. The permission to batch has to survive edits to
+ * the prompt, so it is pinned.
+ */
+test('the tool prompt allows independent calls to be batched into one reply', () => {
+  const prompt = buildToolPrompt([{ name: 'read_file', description: 'read', parameters: {} }]);
+  assert.match(prompt, /emit them all in one reply/i);
+  assert.doesNotMatch(prompt, /one tool call at a time/i);
+});
+
+test('a dependent call, and a call carrying a file, are still sent alone', () => {
+  const prompt = buildToolPrompt([{ name: 'create_file', description: 'write', parameters: {} }]);
+  assert.match(prompt, /depends on what it returns/i);
+  assert.match(prompt, /large file body/i);
+});
+
+/**
+ * Required means the caller cannot use prose: it is waiting for a call and treats
+ * an answer as a failed turn. Before this the mode was read nowhere.
+ */
+test('tool mode Required tells the model it must call a tool', () => {
+  const prompt = buildToolPrompt([{ name: 'edit', description: '', parameters: {} }], { required: true });
+  assert.match(prompt, /MUST call a tool/);
+  assert.doesNotMatch(prompt, /just answer normally/i);
+});
+
+test('without Required the model may still answer in prose', () => {
+  const prompt = buildToolPrompt([{ name: 'edit', description: '', parameters: {} }]);
+  assert.match(prompt, /just answer normally/i);
+  assert.doesNotMatch(prompt, /MUST call a tool/);
+});
+
+/**
+ * The prompt is appended after the whole conversation, so it is the last thing the
+ * model reads. That is why calls come back well-formed - and why it has to hand
+ * attention back, or a model given a tool manual as the final word reaches for a
+ * tool when it should simply answer.
+ */
+test('the tool prompt ends by pointing back at the conversation', () => {
+  const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
+  assert.match(prompt.trim().split('\n').pop(), /most recent request above/i);
+});

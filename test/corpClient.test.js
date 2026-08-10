@@ -10,7 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding, modelFieldConflicts, describeRequest,
+  salvageText, stripPadding, modelFieldConflicts, describeRequest, retryAfterMs,
 } = require('../src/corpClient');
 const { repairJson, parseLenient } = require('../src/jsonRepair');
 
@@ -711,4 +711,110 @@ test('a stream that names no model says so rather than passing for a match', asy
   assert.deepStrictEqual(seenModels,
     [{ requested: 'opus 5.1', served: '', matches: null, confirmed: false }]);
   assert.strictEqual(value.text, 'hi');
+});
+
+// --- retrying the opening request -------------------------------------------
+
+/** A response whose headers answer more than content-type. */
+function withHeaders(res, extra) {
+  return {
+    ...res,
+    headers: {
+      get: (h) => (extra[h.toLowerCase()] ?? res.headers.get(h)),
+    },
+  };
+}
+
+/**
+ * A gateway fronting a shared model returns 429 and 503 routinely under load.
+ * Every one of them used to end the turn - mid agent loop, with the work in
+ * flight lost - which reads as an unreliable model rather than a busy gateway.
+ */
+test('a 503 is retried and the answer still arrives', async () => {
+  let attempt = 0;
+  const { value, seen } = await withFetch(() => {
+    attempt += 1;
+    return attempt === 1
+      ? response({ status: 503, body: 'busy' })
+      : response({ frames: ['{"text":"hello"}'] });
+  }, () => converse(client({ retryBaseMs: 0 })));
+
+  assert.strictEqual(value.text, 'hello');
+  assert.strictEqual(seen.length, 2, 'retried exactly once');
+});
+
+/**
+ * The point of a status allowlist: a 400 or a 401 means the request is wrong, and
+ * sending it again just spends the user's time before showing the same error.
+ */
+test('a rejected request is not retried', async () => {
+  const { seen } = await withFetch(response({ status: 400, body: 'bad field' }),
+    () => converse(client({ retryBaseMs: 0 })).then(() => {}, () => {}));
+  assert.strictEqual(seen.length, 1, 'no retry on a client error');
+});
+
+test('a 401 still raises the auth error rather than being retried', async () => {
+  let error;
+  const { seen } = await withFetch(response({ status: 401, body: 'expired' }),
+    () => converse(client({ retryBaseMs: 0 })).then(() => {}, (e) => { error = e; }));
+  assert.ok(error instanceof CorpAuthError);
+  assert.strictEqual(seen.length, 1);
+});
+
+test('retrying gives up after the attempt budget and reports the last failure', async () => {
+  let error;
+  const { seen } = await withFetch(response({ status: 502, body: 'gateway' }),
+    () => converse(client({ retryBaseMs: 0 })).then(() => {}, (e) => { error = e; }));
+  assert.strictEqual(seen.length, 3, 'one attempt plus two retries');
+  assert.match(error.message, /502/);
+});
+
+test('a dropped connection is retried too', async () => {
+  let attempt = 0;
+  const { value, seen } = await withFetch(() => {
+    attempt += 1;
+    if (attempt === 1) throw new Error('socket hang up');
+    return response({ frames: ['{"text":"recovered"}'] });
+  }, () => converse(client({ retryBaseMs: 0 })));
+
+  assert.strictEqual(value.text, 'recovered');
+  assert.strictEqual(seen.length, 2);
+});
+
+/** Cancelling is a decision, not a failure - retrying it would ignore the user. */
+test('a cancelled request is never retried', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let error;
+  const { seen } = await withFetch(() => {
+    const err = new Error('The operation was aborted.');
+    err.name = 'AbortError';
+    throw err;
+  }, () => converse(client({ retryBaseMs: 0 }), { signal: controller.signal })
+    .then(() => {}, (e) => { error = e; }));
+
+  assert.strictEqual(seen.length, 1);
+  assert.strictEqual(error.name, 'AbortError');
+});
+
+test('a Retry-After delay is preferred over the backoff', async () => {
+  let attempt = 0;
+  const started = Date.now();
+  await withFetch(() => {
+    attempt += 1;
+    return attempt === 1
+      ? withHeaders(response({ status: 429, body: 'slow down' }), { 'retry-after': '0.05' })
+      : response({ frames: ['{"text":"ok"}'] });
+  }, () => converse(client({ retryBaseMs: 0 })));
+
+  assert.ok(Date.now() - started >= 45, 'waited the interval the gateway asked for');
+});
+
+test('Retry-After is read as seconds, as a date, or not at all', () => {
+  assert.strictEqual(retryAfterMs({ headers: { get: () => '2' } }), 2000);
+  assert.strictEqual(retryAfterMs({ headers: { get: () => null } }), null);
+  assert.strictEqual(retryAfterMs({ headers: { get: () => 'not a date' } }), null);
+  const soon = new Date(Date.now() + 3000).toUTCString();
+  const ms = retryAfterMs({ headers: { get: () => soon } });
+  assert.ok(ms > 1000 && ms <= 3000, `date form gave ${ms}`);
 });

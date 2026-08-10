@@ -70,6 +70,7 @@ gateways there is nothing to write at all:
 | `ellm.modelField` | body key holding the picked model | `model` |
 | `ellm.models` | model names, comma separated | — |
 | `ellm.textPath` | dot-path to the text in a frame | *(auto-detect)* |
+| `ellm.contextChars` | prompt characters the backend accepts | `400000` |
 
 `ellm.modelField` is the one worth reading twice. A backend that doesn't recognise the key it
 arrives under doesn't complain — it answers from its default, and the reply looks exactly like a
@@ -271,6 +272,30 @@ ELLM_TEST_WORKSPACE=/path/to/some/repo npm run test:e2e
 It runs in a throwaway VS Code profile, so it never touches your real settings or tokens.
 What a model chooses to emit varies run to run, so the awkward shapes are pinned in the
 deterministic suite rather than left to the live one.
+
+## Getting good agent behaviour out of it
+
+A shimmed model is doing by convention what a native tool-calling model does by protocol, so a
+few settings decide whether agent mode feels usable:
+
+- **`ellm.contextChars` is a promise you make on the backend's behalf.** It becomes the context
+  window the model advertises, and VS Code fills it. Set it above what the backend accepts and
+  the backend truncates — from the *start* of the prompt, which is where the conversation and
+  the system instructions live. Nothing in the reply reveals this happened. If long sessions
+  start ignoring tools or forgetting earlier turns, lower it first.
+- **Independent calls are batched.** The model is asked to emit several
+  `<tool_call>` blocks in one reply when they don't depend on each other, and to send a call
+  alone when it carries a file or when the next step needs its result. Serialising every call
+  costs a full round trip each, through the response cap and the continuation stitcher.
+- **Tool instructions are appended, not prepended.** They sit after the whole conversation, so
+  they're the last thing read before the model writes — and they re-anchor after every tool
+  result.
+- **A busy gateway is retried.** 408, 425, 429 and 5xx get two retries with backoff, honouring
+  `Retry-After`. Only the opening request is replayed; once frames have streamed, a failure is
+  final, because retrying would duplicate what the chat already showed.
+- **Check `params`.** The model parameters block is usually pasted from a DevTools capture of
+  the web chat UI, so it can carry that UI's sampling settings. Agent work wants a low
+  temperature; a chat default of `0.7` shows up as a model that improvises around instructions.
 
 ## Limits worth knowing
 

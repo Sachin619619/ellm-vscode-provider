@@ -41,6 +41,7 @@ function openConfigPanel(context, provider) {
       params: JSON.stringify(getPrivate(context, 'params', {}), null, 2),
       maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
       maxContinuations: readSetting(context, 'maxContinuations', 8),
+      contextChars: readSetting(context, 'contextChars', 400000),
     });
   };
 
@@ -97,6 +98,7 @@ function openConfigPanel(context, provider) {
           logRequestBody,
           maxResponseChars: Number(msg.maxResponseChars) || 5000,
           maxContinuations: Number(msg.maxContinuations) || 8,
+          contextChars: Number(msg.contextChars) || 400000,
         }));
 
         const token = await getToken(context);
@@ -356,6 +358,9 @@ function html(webview) {
     </div>
   </div>
 
+  <label>Prompt char budget <span class="hint">— how much the backend accepts in one request; VS Code fills it, and an over-estimate is truncated from the START, losing the tool definitions</span></label>
+  <input id="contextChars" type="number" min="0" />
+
   <div class="actions">
     <button id="save">Save &amp; Test</button>
     <button id="clear" class="secondary">Clear credentials</button>
@@ -384,6 +389,7 @@ function html(webview) {
       $('params').value = m.params === '{}' ? '' : m.params;
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
+      $('contextChars').value = m.contextChars;
       $('saved').textContent = m.tokenLocation
         ? 'Token saved in ' + m.tokenLocation + '. Leave blank to keep it.'
         : 'No token saved yet.';
@@ -419,6 +425,7 @@ function html(webview) {
       modelField: $('modelField').value,
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
+      contextChars: $('contextChars').value,
     });
     $('token').value = '';
     $('cookie').value = '';

@@ -23,7 +23,18 @@ const BARE_CALL_START = /^\s*\{\s*"name"\s*:/;
 /** Past this, a held-back "{"name": ..." is prose, not a tool call. */
 const MAX_HOLD = 8192;
 
-function buildToolPrompt(tools) {
+/**
+ * @param tools     the tool schemas the client offered
+ * @param required  the client set toolMode=Required: this reply MUST be a call
+ *
+ * Written to be read LAST, not first - the provider appends it after the whole
+ * conversation, so it sits close to where the model starts writing. Hence the closing
+ * line pointing back up at the conversation: instructions that sit at the end of a
+ * prompt are followed far more reliably, but they also become the most recent
+ * thing said, and a model handed a tool manual as the final word will reach for a
+ * tool when it should just answer.
+ */
+function buildToolPrompt(tools, { required = false } = {}) {
   const specs = tools.map((t) => {
     const fn = t.function ?? t;
     return JSON.stringify({
@@ -47,21 +58,24 @@ function buildToolPrompt(tools) {
     '- Inside a JSON string, write a double quote as \\" and a backslash as \\\\. '
     + 'This applies to file contents too: a Python """docstring""", a Windows path, '
     + 'or code containing quotes must all be escaped.',
-    '- Emit one tool call at a time, then stop and wait for the result.',
+    // Serialising every call was costing a round trip each, through a capped and
+    // stitched transport - the single biggest reason a task took many more turns
+    // here than on a model with native tool calling.
+    '- When several calls do not depend on each other - reading or searching a few '
+    + `files, say - emit them all in one reply, each in its own ${OPEN}...${CLOSE} block.`,
+    '- Emit a call alone, and wait for its result, when the next call depends on what '
+    + 'it returns, or when the call carries a large file body.',
     '- Never wrap the tool call in markdown or code fences.',
-    '- If no tool is needed, just answer normally in plain text.',
+    required
+      // Required means the client cannot use prose - it is waiting for a call and
+      // will treat an answer as a failed turn.
+      ? '- You MUST call a tool in this reply. Do not answer in prose.'
+      : '- If no tool is needed, just answer normally in plain text.',
+    '',
+    required
+      ? 'Now call the tool needed for the most recent request above.'
+      : 'Now answer the most recent request above, calling tools only if they are needed.',
   ].join('\n');
-}
-
-/** Inject the tool protocol into the outgoing message list. */
-function injectToolPrompt(messages, tools) {
-  if (!tools?.length) return messages;
-  const prompt = buildToolPrompt(tools);
-  const first = messages[0];
-  if (first?.role === 'system' && typeof first.content === 'string') {
-    return [{ ...first, content: `${first.content}\n\n${prompt}` }, ...messages.slice(1)];
-  }
-  return [{ role: 'system', content: prompt }, ...messages];
 }
 
 /**
@@ -275,7 +289,6 @@ class ToolCallScanner {
 
 module.exports = {
   buildToolPrompt,
-  injectToolPrompt,
   ToolCallScanner,
   hasOpenToolCall,
   restartsToolCall,
