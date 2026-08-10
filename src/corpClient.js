@@ -311,8 +311,27 @@ function modelFieldConflicts({ extra, modelField, models = [] } = {}) {
   return found;
 }
 
-/** Header and body keys whose values are credentials rather than configuration. */
-const SECRET_KEY_HINT = /token|secret|password|auth|cookie|apikey|api_key|credential|session/i;
+/**
+ * Header and body keys whose values are credentials rather than configuration.
+ *
+ * Matched against the key with its separators removed, because real header names are
+ * hyphenated: `X-Api-Key` does not contain "apikey" or "api_key" until the hyphens go,
+ * so it printed its value in full. That matters more than it looks - the auth header
+ * name is configurable in the panel, and `describeRequest` output exists to be pasted
+ * to someone else for diagnosis. A credential is only safe here if it is masked no
+ * matter what the field is called.
+ *
+ * "signature" but not "sig": stripping separators makes a bare "sig" match "design"
+ * and "assign", and over-masking buries the configuration this view exists to show.
+ */
+const SECRET_KEY_HINT = new RegExp([
+  'token', 'secret', 'password', 'passwd', 'pwd', 'auth', 'cookie',
+  'apikey', 'accesskey', 'privatekey', 'credential', 'session',
+  'jwt', 'signature', 'csrf', 'xsrf', 'bearer', 'oauth', 'saml', 'assertion', 'refresh',
+].join('|'), 'i');
+
+/** A key with separators and casing removed, so `X-Api-Key` reads as `xapikey`. */
+const normaliseKey = (key) => String(key ?? '').replace(/[^a-z0-9]/gi, '');
 
 /**
  * Token *limits*, which are configuration and not credentials. `max_tokens`
@@ -338,8 +357,9 @@ function describeRequest({ url, body, headers, promptField }, { values = true } 
       return `<prompt, ${len} chars, hidden>`;
     }
     if (typeof value !== 'string') return value; // a credential is never a number
+    // Tested on the original key: the limit names are already separator-tolerant.
     if (TOKEN_LIMIT_KEY.test(key)) return value;
-    if (SECRET_KEY_HINT.test(key)) return `<${value.length} chars, hidden>`;
+    if (SECRET_KEY_HINT.test(normaliseKey(key))) return `<${value.length} chars, hidden>`;
     return value;
   };
 

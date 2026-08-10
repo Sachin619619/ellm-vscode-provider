@@ -255,6 +255,56 @@ test('a token limit is a number, not a credential, and stays visible', () => {
   assert.match(shown, /"authToken": "<8 chars, hidden>"/);
 });
 
+/**
+ * The auth header name is configurable, and this view exists to be pasted to someone
+ * else for diagnosis - so a credential has to be masked whatever it is called. Real
+ * header names are hyphenated, and `X-Api-Key` does not contain "apikey" until the
+ * hyphens are removed: it used to print in full.
+ */
+test('a hyphenated credential header is masked, not printed', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: { 'X-Api-Key': 'LEAKED-API-KEY', 'X-Session-Id': 'abcdefgh' },
+    body: {},
+    promptField: 'prompt',
+  });
+  assert.doesNotMatch(shown, /LEAKED-API-KEY/);
+  assert.doesNotMatch(shown, /abcdefgh/);
+});
+
+test('credentials under names other than "token" are masked', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: {},
+    body: {
+      jwt: 'JWTVALUE', signature: 'SIGVALUE', 'refresh-key': 'REFRESHVALUE',
+      csrf: 'CSRFVALUE', bearer: 'BEARERVALUE',
+    },
+    promptField: 'prompt',
+  });
+  for (const leak of ['JWTVALUE', 'SIGVALUE', 'REFRESHVALUE', 'CSRFVALUE', 'BEARERVALUE']) {
+    assert.doesNotMatch(shown, new RegExp(leak));
+  }
+});
+
+/**
+ * Over-masking is the other failure: this view exists to show which field selects the
+ * model, and a hidden value cannot be compared against DevTools. Stripping separators
+ * is what makes a bare "sig" dangerous - it would match "design".
+ */
+test('configuration that merely looks credential-ish stays visible', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: {},
+    body: { model: 'alpha-1', design: 'compact', assignee: 'team-b', mode: 'general' },
+    promptField: 'prompt',
+  });
+  assert.match(shown, /"model": "alpha-1"/);
+  assert.match(shown, /"design": "compact"/);
+  assert.match(shown, /"assignee": "team-b"/);
+  assert.match(shown, /"mode": "general"/);
+});
+
 test('a credential nested inside the identity block is masked too', () => {
   const shown = describeRequest({
     url: 'https://llm.example.com/chat',
