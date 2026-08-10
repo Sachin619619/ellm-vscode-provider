@@ -37,29 +37,6 @@ function stripPadding(text) {
   return text.replace(PADDING, '');
 }
 
-/**
- * Statuses that mean "busy or briefly broken", not "wrong".
- *
- * A gateway in front of a shared model returns these routinely under load. Every
- * one of them used to end the turn: the error propagated out of the provider and
- * VS Code showed a failed request, mid-agent-loop, with whatever work was in
- * flight lost. The client is free to retry because nothing has been streamed yet -
- * see `fetchWithRetry`, which deliberately only guards the opening request.
- */
-const RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
-const RETRY_ATTEMPTS = 2;
-const RETRY_BASE_MS = 600;
-
-/** `Retry-After` in ms, seconds or HTTP-date, or null when it says nothing usable. */
-function retryAfterMs(res) {
-  const raw = res.headers?.get?.('retry-after');
-  if (!raw) return null;
-  const seconds = Number(raw);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-  const at = Date.parse(raw);
-  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
-}
-
 const DEFAULT_AUTH_HEADER = 'X-Corp-Auth';
 const DEFAULT_CHAT_PATH = '/chat';
 const DEFAULT_PROMPT_FIELD = 'prompt';
@@ -311,17 +288,15 @@ function modelFieldConflicts({ extra, modelField, models = [] } = {}) {
   return found;
 }
 
+/** Header and body keys whose values are credentials rather than configuration. */
 /**
- * Header and body keys whose values are credentials rather than configuration.
- *
  * Matched against the key with its separators removed, because real header names are
  * hyphenated: `X-Api-Key` does not contain "apikey" or "api_key" until the hyphens go,
- * so it printed its value in full. That matters more than it looks - the auth header
- * name is configurable in the panel, and `describeRequest` output exists to be pasted
- * to someone else for diagnosis. A credential is only safe here if it is masked no
- * matter what the field is called.
+ * so it printed its value in full. This view exists to be pasted to someone else for
+ * diagnosis, and the auth header name is configurable, so a credential is only safe
+ * here if it is masked no matter what the field is called.
  *
- * "signature" but not "sig": stripping separators makes a bare "sig" match "design"
+ * "signature" but not "sig": with separators stripped a bare "sig" matches "design"
  * and "assign", and over-masking buries the configuration this view exists to show.
  */
 const SECRET_KEY_HINT = new RegExp([
@@ -357,7 +332,6 @@ function describeRequest({ url, body, headers, promptField }, { values = true } 
       return `<prompt, ${len} chars, hidden>`;
     }
     if (typeof value !== 'string') return value; // a credential is never a number
-    // Tested on the original key: the limit names are already separator-tolerant.
     if (TOKEN_LIMIT_KEY.test(key)) return value;
     if (SECRET_KEY_HINT.test(normaliseKey(key))) return `<${value.length} chars, hidden>`;
     return value;
@@ -449,79 +423,11 @@ async function failureFor(res, url, client) {
   return new Error(`Enterprise LLM returned ${where}${snippet ? `: ${snippet}` : ''}`);
 }
 
-/** Marks where dropped history was, so the model knows the gap is deliberate. */
-const OMITTED_NOTE = '[earlier conversation omitted to fit the context limit]';
-
-/**
- * Drop old turns until the conversation fits, oldest first.
- *
- * The backend truncates an over-length prompt from the FRONT. That was survivable
- * while the tool protocol sat at the front and the request at the back - the protocol
- * was what got eaten. Once the protocol moved to the back for anchoring, the front was
- * the request itself, and the model received a tool manual ending in "answer the most
- * recent request above" with nothing above it. It answered the only way it could: that
- * it could not see a request.
- *
- * So the trim happens here, where which turns matter is known. The final turn is never
- * dropped (it is the request), and neither is a trailing system turn (the protocol).
- * Everything else is history, and history is what a context limit is for spending.
- */
-function fitTurns(turns, budget, { onTrim } = {}) {
-  if (!budget || budget <= 0 || !Array.isArray(turns) || turns.length < 2) return turns;
-
-  const size = (t) => String(t?.utterance ?? '').length + 12; // + "Assistant: " and the blank line
-  const total = (list) => list.reduce((n, t) => n + size(t), 0);
-  if (total(turns) <= budget) return turns;
-
-  // The instructions the provider wraps the conversation in: a leading block of tool
-  // schemas and a trailing reminder, both system turns. Neither is history and neither
-  // may be dropped - losing the schemas breaks every tool call.
-  let head = 0;
-  while (head < turns.length && turns[head].speaker === 'system') head++;
-  let tail = turns.length;
-  while (tail > head && turns[tail - 1].speaker === 'system') tail--;
-
-  // ...plus the last real turn, which is the request itself. Protecting "the last
-  // turn" was not enough once a system reminder was appended after it: the reminder
-  // was kept and the question it referred to was dropped.
-  const request = tail > head ? tail - 1 : head;
-  const pinned = [...turns.slice(0, head), ...turns.slice(request, tail), ...turns.slice(tail)];
-  const history = turns.slice(head, request);
-
-  // Newest history first, so what survives is what was said most recently.
-  const room = budget - total(pinned) - OMITTED_NOTE.length - 12;
-  const kept = [];
-  let used = 0;
-  for (let i = history.length - 1; i >= 0; i--) {
-    const cost = size(history[i]);
-    if (used + cost > room) break;
-    used += cost;
-    kept.unshift(history[i]);
-  }
-
-  const dropped = history.length - kept.length;
-  if (dropped > 0) {
-    onTrim?.(`prompt over ${budget} chars - dropped ${dropped} of ${history.length} history `
-      + 'turn(s). Lower ellm.contextChars if the backend still truncates, raise it if this is '
-      + 'cutting useful history.');
-    // The pinned turns alone can still exceed the budget - one huge file in the
-    // request. Nothing more can go without losing the request itself, so it is sent
-    // whole and the line above is the only warning there will be.
-    return [
-      ...turns.slice(0, head),
-      { speaker: 'system', utterance: OMITTED_NOTE },
-      ...kept,
-      ...turns.slice(request, turns.length),
-    ];
-  }
-  return turns;
-}
-
 class CorpClient {
   constructor({
     url, token, authHeader, authPrefix, cookie, chatPath, promptField, modelField,
     model, models, identity, params, textPath, servedModelPath,
-    contextChars, maxResponseChars, retryBaseMs,
+    contextChars, maxResponseChars,
   } = {}) {
     // Which body key carries the prompt is the backend's business, not this file's.
     this.promptField = promptField || DEFAULT_PROMPT_FIELD;
@@ -543,8 +449,6 @@ class CorpClient {
     this.servedModelPath = servedModelPath || '';
     this.contextChars = contextChars || 400000;
     this.maxResponseChars = maxResponseChars || 5000;
-    // Only the tests set this, so a retry test does not spend real seconds asleep.
-    this.retryBaseMs = retryBaseMs ?? RETRY_BASE_MS;
   }
 
   get configured() {
@@ -588,20 +492,16 @@ class CorpClient {
    * itself, keyed by conversation id. VS Code already replays the whole
    * conversation every turn, so history is flattened in here and server-side
    * memory is left off; otherwise every turn would be remembered twice.
-   *
-   * Over-length prompts are trimmed HERE rather than left to the backend, which
-   * truncates from the front and would take the request itself. `contextChars` was
-   * only ever advertised to VS Code as a token budget; nothing enforced it on the
-   * way out, so a conversation that outgrew the backend arrived decapitated.
    */
-  toPrompt(turns, { onTrim } = {}) {
+  toPrompt(turns) {
     const label = { system: 'System', human: 'User', assistant: 'Assistant' };
     if (turns.length === 1) return turns[0].utterance ?? '';
-    const render = (t) => `${label[t.speaker] ?? 'User'}: ${t.utterance ?? ''}`;
-    return fitTurns(turns, this.contextChars, { onTrim }).map(render).join('\n\n');
+    return turns
+      .map((t) => `${label[t.speaker] ?? 'User'}: ${t.utterance ?? ''}`)
+      .join('\n\n');
   }
 
-  body({ modelAlias, turns, onTrim }) {
+  body({ modelAlias, turns }) {
     return {
       ...this.identity, // whatever extra fields the backend expects, verbatim
       ...this.params, // tuning knobs, exactly as configured
@@ -609,7 +509,7 @@ class CorpClient {
       // extra fields. It cannot win over a *differently named* field, which is
       // what modelFieldConflicts is for.
       [this.modelField]: modelAlias || this.model,
-      [this.promptField]: this.toPrompt(turns, { onTrim }),
+      [this.promptField]: this.toPrompt(turns),
       stream: true,
     };
   }
@@ -634,67 +534,18 @@ class CorpClient {
     };
   }
 
-  /**
-   * The opening request, retried while it is still safe to retry.
-   *
-   * Only the request BEFORE the first byte is replayable: once frames have been
-   * yielded, the consumer has already streamed them into the chat and a second
-   * attempt would duplicate them. So this returns the response and never touches
-   * the stream - a mid-stream failure stays fatal, correctly.
-   */
-  async fetchWithRetry({ modelAlias, turns, signal, onRetry, onTrim }) {
-    const url = this.endpoint;
-    const init = {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify(this.body({ modelAlias, turns, onTrim })),
-      signal,
-    };
-
-    let lastError;
-    for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
-      if (attempt > 0) {
-        // Exponential, with jitter so several requests do not retry in lockstep.
-        const wait = lastError?.retryAfter
-          ?? this.retryBaseMs * (2 ** (attempt - 1)) * (1 + Math.random());
-        onRetry?.(`${lastError?.why ?? 'request failed'} - retrying in ${Math.round(wait)}ms `
-          + `(attempt ${attempt + 1} of ${RETRY_ATTEMPTS + 1})`);
-        await new Promise((resolve) => { setTimeout(resolve, wait); });
-        if (signal?.aborted) throw new Error('Request cancelled.');
-      }
-
-      let res;
-      try {
-        res = await fetch(url, init);
-      } catch (err) {
-        // A cancelled request is not a failed one - never retry it.
-        if (signal?.aborted || err?.name === 'AbortError') throw err;
-        lastError = { why: `could not reach ${url} (${err.message})`, error: err };
-        if (attempt === RETRY_ATTEMPTS) throw err;
-        continue;
-      }
-
-      if (res.ok || !RETRY_STATUS.has(res.status)) return res;
-      if (attempt === RETRY_ATTEMPTS) return res;
-      lastError = {
-        why: `${url} answered ${res.status}`,
-        retryAfter: retryAfterMs(res),
-      };
-      // The body is not needed, but leaving it unread keeps the socket busy.
-      try { await res.arrayBuffer(); } catch { /* nothing to drain */ }
-    }
-
-    throw lastError?.error ?? new Error(`${url} could not be reached.`);
-  }
-
   /** Yields { type:'text', text } then a final { type:'finish', reason }. */
   async *converse({
-    modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest, onRetry,
-    onTrim,
+    modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest,
   }) {
     const url = this.endpoint;
     if (onRequest) onRequest(this.requestShape({ modelAlias, turns }));
-    const res = await this.fetchWithRetry({ modelAlias, turns, signal, onRetry, onTrim });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(this.body({ modelAlias, turns })),
+      signal,
+    });
 
     if (!res.ok) throw await failureFor(res, url, this);
     if (!res.body) throw new Error(`${url} answered ${res.status} with no body to stream.`);
@@ -873,8 +724,7 @@ class CorpClient {
 }
 
 module.exports = {
-  fitTurns,
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding, isTransportEnvelope, retryAfterMs,
+  salvageText, stripPadding, isTransportEnvelope,
   modelFieldConflicts, describeConflict, normalizeModel, describeRequest,
 };

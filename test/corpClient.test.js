@@ -10,7 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding, modelFieldConflicts, describeRequest, retryAfterMs, fitTurns,
+  salvageText, stripPadding, modelFieldConflicts, describeRequest,
 } = require('../src/corpClient');
 const { repairJson, parseLenient } = require('../src/jsonRepair');
 
@@ -253,56 +253,6 @@ test('a token limit is a number, not a credential, and stays visible', () => {
   assert.match(shown, /"max_tokens": 4096/);
   assert.match(shown, /"maxTokens": "8192"/);
   assert.match(shown, /"authToken": "<8 chars, hidden>"/);
-});
-
-/**
- * The auth header name is configurable, and this view exists to be pasted to someone
- * else for diagnosis - so a credential has to be masked whatever it is called. Real
- * header names are hyphenated, and `X-Api-Key` does not contain "apikey" until the
- * hyphens are removed: it used to print in full.
- */
-test('a hyphenated credential header is masked, not printed', () => {
-  const shown = describeRequest({
-    url: 'https://llm.example.com/chat',
-    headers: { 'X-Api-Key': 'LEAKED-API-KEY', 'X-Session-Id': 'abcdefgh' },
-    body: {},
-    promptField: 'prompt',
-  });
-  assert.doesNotMatch(shown, /LEAKED-API-KEY/);
-  assert.doesNotMatch(shown, /abcdefgh/);
-});
-
-test('credentials under names other than "token" are masked', () => {
-  const shown = describeRequest({
-    url: 'https://llm.example.com/chat',
-    headers: {},
-    body: {
-      jwt: 'JWTVALUE', signature: 'SIGVALUE', 'refresh-key': 'REFRESHVALUE',
-      csrf: 'CSRFVALUE', bearer: 'BEARERVALUE',
-    },
-    promptField: 'prompt',
-  });
-  for (const leak of ['JWTVALUE', 'SIGVALUE', 'REFRESHVALUE', 'CSRFVALUE', 'BEARERVALUE']) {
-    assert.doesNotMatch(shown, new RegExp(leak));
-  }
-});
-
-/**
- * Over-masking is the other failure: this view exists to show which field selects the
- * model, and a hidden value cannot be compared against DevTools. Stripping separators
- * is what makes a bare "sig" dangerous - it would match "design".
- */
-test('configuration that merely looks credential-ish stays visible', () => {
-  const shown = describeRequest({
-    url: 'https://llm.example.com/chat',
-    headers: {},
-    body: { model: 'alpha-1', design: 'compact', assignee: 'team-b', mode: 'general' },
-    promptField: 'prompt',
-  });
-  assert.match(shown, /"model": "alpha-1"/);
-  assert.match(shown, /"design": "compact"/);
-  assert.match(shown, /"assignee": "team-b"/);
-  assert.match(shown, /"mode": "general"/);
 });
 
 test('a credential nested inside the identity block is masked too', () => {
@@ -763,204 +713,33 @@ test('a stream that names no model says so rather than passing for a match', asy
   assert.strictEqual(value.text, 'hi');
 });
 
-// --- retrying the opening request -------------------------------------------
-
-/** A response whose headers answer more than content-type. */
-function withHeaders(res, extra) {
-  return {
-    ...res,
-    headers: {
-      get: (h) => (extra[h.toLowerCase()] ?? res.headers.get(h)),
-    },
-  };
-}
-
 /**
- * A gateway fronting a shared model returns 429 and 503 routinely under load.
- * Every one of them used to end the turn - mid agent loop, with the work in
- * flight lost - which reads as an unreliable model rather than a busy gateway.
+ * The auth header name is configurable and this view exists to be pasted to someone
+ * else, so a credential must be masked whatever it is called. Real header names are
+ * hyphenated, and `X-Api-Key` does not contain "apikey" until the hyphens are removed.
  */
-test('a 503 is retried and the answer still arrives', async () => {
-  let attempt = 0;
-  const { value, seen } = await withFetch(() => {
-    attempt += 1;
-    return attempt === 1
-      ? response({ status: 503, body: 'busy' })
-      : response({ frames: ['{"text":"hello"}'] });
-  }, () => converse(client({ retryBaseMs: 0 })));
-
-  assert.strictEqual(value.text, 'hello');
-  assert.strictEqual(seen.length, 2, 'retried exactly once');
+test('a hyphenated credential header is masked, not printed', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: { 'X-Api-Key': 'LEAKED-API-KEY', 'X-Session-Id': 'abcdefgh' },
+    body: { jwt: 'JWTVALUE', signature: 'SIGVALUE' },
+    promptField: 'prompt',
+  });
+  for (const leak of ['LEAKED-API-KEY', 'abcdefgh', 'JWTVALUE', 'SIGVALUE']) {
+    assert.doesNotMatch(shown, new RegExp(leak));
+  }
 });
 
-/**
- * The point of a status allowlist: a 400 or a 401 means the request is wrong, and
- * sending it again just spends the user's time before showing the same error.
- */
-test('a rejected request is not retried', async () => {
-  const { seen } = await withFetch(response({ status: 400, body: 'bad field' }),
-    () => converse(client({ retryBaseMs: 0 })).then(() => {}, () => {}));
-  assert.strictEqual(seen.length, 1, 'no retry on a client error');
-});
-
-test('a 401 still raises the auth error rather than being retried', async () => {
-  let error;
-  const { seen } = await withFetch(response({ status: 401, body: 'expired' }),
-    () => converse(client({ retryBaseMs: 0 })).then(() => {}, (e) => { error = e; }));
-  assert.ok(error instanceof CorpAuthError);
-  assert.strictEqual(seen.length, 1);
-});
-
-test('retrying gives up after the attempt budget and reports the last failure', async () => {
-  let error;
-  const { seen } = await withFetch(response({ status: 502, body: 'gateway' }),
-    () => converse(client({ retryBaseMs: 0 })).then(() => {}, (e) => { error = e; }));
-  assert.strictEqual(seen.length, 3, 'one attempt plus two retries');
-  assert.match(error.message, /502/);
-});
-
-test('a dropped connection is retried too', async () => {
-  let attempt = 0;
-  const { value, seen } = await withFetch(() => {
-    attempt += 1;
-    if (attempt === 1) throw new Error('socket hang up');
-    return response({ frames: ['{"text":"recovered"}'] });
-  }, () => converse(client({ retryBaseMs: 0 })));
-
-  assert.strictEqual(value.text, 'recovered');
-  assert.strictEqual(seen.length, 2);
-});
-
-/** Cancelling is a decision, not a failure - retrying it would ignore the user. */
-test('a cancelled request is never retried', async () => {
-  const controller = new AbortController();
-  controller.abort();
-  let error;
-  const { seen } = await withFetch(() => {
-    const err = new Error('The operation was aborted.');
-    err.name = 'AbortError';
-    throw err;
-  }, () => converse(client({ retryBaseMs: 0 }), { signal: controller.signal })
-    .then(() => {}, (e) => { error = e; }));
-
-  assert.strictEqual(seen.length, 1);
-  assert.strictEqual(error.name, 'AbortError');
-});
-
-test('a Retry-After delay is preferred over the backoff', async () => {
-  let attempt = 0;
-  const started = Date.now();
-  await withFetch(() => {
-    attempt += 1;
-    return attempt === 1
-      ? withHeaders(response({ status: 429, body: 'slow down' }), { 'retry-after': '0.05' })
-      : response({ frames: ['{"text":"ok"}'] });
-  }, () => converse(client({ retryBaseMs: 0 })));
-
-  assert.ok(Date.now() - started >= 45, 'waited the interval the gateway asked for');
-});
-
-test('Retry-After is read as seconds, as a date, or not at all', () => {
-  assert.strictEqual(retryAfterMs({ headers: { get: () => '2' } }), 2000);
-  assert.strictEqual(retryAfterMs({ headers: { get: () => null } }), null);
-  assert.strictEqual(retryAfterMs({ headers: { get: () => 'not a date' } }), null);
-  const soon = new Date(Date.now() + 3000).toUTCString();
-  const ms = retryAfterMs({ headers: { get: () => soon } });
-  assert.ok(ms > 1000 && ms <= 3000, `date form gave ${ms}`);
-});
-
-/**
- * The backend truncates an over-length prompt from the FRONT, so whatever is first
- * is what disappears. With the protocol appended last (v0.4.0) the request was
- * first, and the model received a tool manual with no request attached - it replied
- * that it could not see a question. The trim happens here now, where which turns
- * matter is known.
- */
-test('an over-length conversation drops old history, never the request', () => {
-  const big = (n, who) => ({ speaker: who, utterance: 'x'.repeat(n) });
-  const turns = [
-    big(400, 'human'), big(400, 'assistant'), big(400, 'human'), big(400, 'assistant'),
-    { speaker: 'system', utterance: 'TOOL PROTOCOL' },
-    { speaker: 'human', utterance: 'THE ACTUAL REQUEST' },
-  ];
-  const notes = [];
-  const kept = fitTurns(turns, 900, { onTrim: (m) => notes.push(m) });
-
-  const text = kept.map((t) => t.utterance).join('|');
-  assert.match(text, /THE ACTUAL REQUEST/);
-  assert.match(text, /TOOL PROTOCOL/);
-  assert.match(text, /earlier conversation omitted/);
-  assert.ok(kept.length < turns.length, 'something was dropped');
-  assert.strictEqual(notes.length, 1, 'the drop was reported exactly once');
-});
-
-test('a conversation that already fits is returned untouched', () => {
-  const turns = [
-    { speaker: 'human', utterance: 'hello' },
-    { speaker: 'system', utterance: 'TOOL PROTOCOL' },
-    { speaker: 'human', utterance: 'the request' },
-  ];
-  const notes = [];
-  assert.strictEqual(fitTurns(turns, 100000, { onTrim: (m) => notes.push(m) }), turns);
-  assert.strictEqual(notes.length, 0);
-});
-
-/**
- * Nothing can be dropped without losing the request itself, so it goes out whole and
- * the log line is the only warning. Silently sending an empty prompt would be worse.
- */
-test('a request too big for the budget is still sent, with a warning', () => {
-  const turns = [
-    { speaker: 'human', utterance: 'old' },
-    { speaker: 'human', utterance: 'y'.repeat(5000) },
-  ];
-  const notes = [];
-  const kept = fitTurns(turns, 500, { onTrim: (m) => notes.push(m) });
-  assert.match(kept[kept.length - 1].utterance, /^y+$/);
-  assert.strictEqual(notes.length, 1);
-});
-
-test('the newest history survives, not the oldest', () => {
-  const turns = [
-    { speaker: 'human', utterance: `OLDEST ${'x'.repeat(300)}` },
-    { speaker: 'human', utterance: `NEWEST ${'x'.repeat(300)}` },
-    { speaker: 'human', utterance: 'the request' },
-  ];
-  const text = fitTurns(turns, 500, {}).map((t) => t.utterance).join('|');
-  assert.match(text, /NEWEST/);
-  assert.doesNotMatch(text, /OLDEST/);
-});
-
-/** With no budget configured the conversation must pass through unchanged. */
-test('a zero or missing budget disables trimming', () => {
-  const turns = [{ speaker: 'human', utterance: 'a' }, { speaker: 'human', utterance: 'b' }];
-  assert.strictEqual(fitTurns(turns, 0, {}), turns);
-  assert.strictEqual(fitTurns(turns, undefined, {}), turns);
-});
-
-/**
- * Once a system reminder is appended after the conversation, "the last turn" is the
- * reminder - not the request. Protecting only the last turn kept the reminder and
- * dropped the question it referred to.
- */
-test('trimming pins the schemas, the request, and the trailing reminder', () => {
-  const big = (n, who) => ({ speaker: who, utterance: 'x'.repeat(n) });
-  const turns = [
-    { speaker: 'system', utterance: 'TOOL SCHEMAS' },
-    big(400, 'human'), big(400, 'assistant'), big(400, 'human'), big(400, 'assistant'),
-    { speaker: 'human', utterance: 'THE ACTUAL REQUEST' },
-    { speaker: 'system', utterance: 'REMINDER' },
-  ];
-  const kept = fitTurns(turns, 900, {});
-  const text = kept.map((t) => t.utterance).join('|');
-
-  assert.match(text, /TOOL SCHEMAS/);
-  assert.match(text, /THE ACTUAL REQUEST/);
-  assert.match(text, /REMINDER/);
-  assert.match(text, /earlier conversation omitted/);
-  assert.ok(kept.length < turns.length, 'history was dropped');
-  // Order has to survive too: schemas first, reminder last.
-  assert.strictEqual(kept[0].utterance, 'TOOL SCHEMAS');
-  assert.strictEqual(kept[kept.length - 1].utterance, 'REMINDER');
-  assert.strictEqual(kept[kept.length - 2].utterance, 'THE ACTUAL REQUEST');
+/** Over-masking is the other failure: this view exists to show the model field. */
+test('configuration that merely looks credential-ish stays visible', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/chat',
+    headers: {},
+    body: { model: 'alpha-1', design: 'compact', assignee: 'team-b', max_tokens: 4096 },
+    promptField: 'prompt',
+  });
+  assert.match(shown, /"model": "alpha-1"/);
+  assert.match(shown, /"design": "compact"/);
+  assert.match(shown, /"assignee": "team-b"/);
+  assert.match(shown, /"max_tokens": 4096/);
 });

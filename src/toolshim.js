@@ -24,21 +24,18 @@ const BARE_CALL_START = /^\s*\{\s*"name"\s*:/;
 const MAX_HOLD = 8192;
 
 /**
- * Headroom left between the backend's hard cap and the budget we ask the model for.
+ * Headroom between the backend's hard cap and the budget the model is given.
  *
- * The cap is enforced by the backend mid-word, with no warning; a model asked to aim
- * at exactly the cap overshoots it routinely, so the number it is given has to be the
- * lower one. 500 is enough to absorb a normal overshoot without wasting a useful
- * fraction of a 5000-char response.
+ * The cap is enforced mid-word with no warning, and a model aiming at exactly the cap
+ * overshoots it routinely, so the number it is told has to be the lower one.
  */
 const RESPONSE_MARGIN = 500;
 
 /**
- * Of that budget, how much may be file content inside a call.
- *
- * The rest is the JSON envelope plus escaping, and escaping is the part that bites:
- * a file thick with quotes and backslashes grows on its way into a JSON string, so a
- * body measured at the full budget crosses the cap once escaped.
+ * How much of that budget may be file content inside a call. The rest is the JSON
+ * envelope plus escaping - and escaping is the part that bites: a file thick with
+ * quotes and backslashes grows on its way into a JSON string, so a body measured at
+ * the full budget crosses the cap once escaped.
  */
 const CALL_CONTENT_RATIO = 0.7;
 
@@ -49,18 +46,10 @@ function budgetFor(cap) {
 }
 
 /**
- * @param tools     the tool schemas the client offered
- * @param required  the client set toolMode=Required: this reply MUST be a call
+ * @param tools        the tool schemas the client offered
  * @param budgetChars  chars this reply should stay under; 0 omits the budget rules
- *
- * Written to be read LAST, not first - the provider appends it after the whole
- * conversation, so it sits close to where the model starts writing. Hence the closing
- * line pointing back up at the conversation: instructions that sit at the end of a
- * prompt are followed far more reliably, but they also become the most recent
- * thing said, and a model handed a tool manual as the final word will reach for a
- * tool when it should just answer.
  */
-function buildToolPrompt(tools, { required = false, budgetChars = 0 } = {}) {
+function buildToolPrompt(tools, { budgetChars = 0 } = {}) {
   const specs = tools.map((t) => {
     const fn = t.function ?? t;
     return JSON.stringify({
@@ -84,72 +73,37 @@ function buildToolPrompt(tools, { required = false, budgetChars = 0 } = {}) {
     '- Inside a JSON string, write a double quote as \\" and a backslash as \\\\. '
     + 'This applies to file contents too: a Python """docstring""", a Windows path, '
     + 'or code containing quotes must all be escaped.',
-    // Serialising every call was costing a round trip each, through a capped and
-    // stitched transport - the single biggest reason a task took many more turns
-    // here than on a model with native tool calling.
-    '- When several calls do not depend on each other - reading or searching a few '
-    + `files, say - emit them all in one reply, each in its own ${OPEN}...${CLOSE} block.`,
-    '- Emit a call alone, and wait for its result, when the next call depends on what '
-    + 'it returns, or when the call carries a large file body.',
+    '- Emit one tool call at a time, then stop and wait for the result.',
     '- Never wrap the tool call in markdown or code fences.',
-    // Everything above this point recovers from the cap after the fact - stitching a
+    // Everything else about the cap recovers from it AFTER the fact - stitching a
     // guillotined reply, dropping a restarted call, repairing the JSON a truncation
-    // left behind. This rule is the only one that tries to avoid the truncation, and
-    // it is far cheaper than any of them: a call that fits is never split, so it never
-    // needs repairing.
+    // left behind. This is the only rule that tries to avoid the truncation, and it is
+    // far cheaper than any of them: a call that fits is never split, so it never needs
+    // repairing.
     ...(budgetChars ? [
       `- Keep each reply under ${budgetChars} characters. The backend stops you at a hard `
       + 'limit just above that, mid-word and without warning. The rest is recovered over '
       + 'extra round trips, so a reply that fits is both faster and safer.',
-      `- A tool call must NEVER be cut off by that limit. If a call would carry more than `
+      '- A tool call must NEVER be cut off by that limit. If a call would carry more than '
       + `about ${Math.floor(budgetChars * CALL_CONTENT_RATIO)} characters of file content, `
       + 'do not write it as one call: write the first part, wait for the result, then add '
       + 'each further part with a follow-up edit or append call. Escaping makes the JSON '
       + 'longer than the content, so leave room.',
       '- Prefer editing the specific lines that change over rewriting a whole file.',
     ] : []),
-    required
-      // Required means the client cannot use prose - it is waiting for a call and
-      // will treat an answer as a failed turn.
-      ? '- You MUST call a tool in this reply. Do not answer in prose.'
-      : '- If no tool is needed, just answer normally in plain text.',
-    '',
-    // The protocol sits at the FRONT, so the conversation follows it. It must not
-    // claim the request is the very next message: in an agent round the next thing
-    // is a tool result, and the request is further down.
-    'The conversation follows. Everything above is protocol, not a request.',
+    '- If no tool is needed, just answer normally in plain text.',
   ].join('\n');
 }
 
-/**
- * The short anchor that goes LAST, after the whole conversation.
- *
- * Two positions have now been tried for the full protocol and both failed. At the
- * front, the tag rules were thousands of characters from where the model started
- * writing and calls came back malformed. At the back, the protocol is ~12k characters
- * with a real tool list, so it displaced the request - first off the front of a
- * front-truncating backend, then, once the request was kept last, into a shape where
- * the model answered the protocol instead of the question.
- *
- * The mistake was treating it as one block that had to be somewhere. The schemas are
- * bulky and only need to be present; the rules that shape the next few hundred
- * characters are what needs to be near the writing. So the schemas go first, where
- * they displace nothing, and this goes last, where it is small enough to displace
- * nothing either.
- *
- * It must not name which message is the request. In an agent round the last turn is a
- * tool result, and any claim about position is wrong half the time - which is exactly
- * how the last two versions broke.
- */
-function buildToolReminder({ budgetChars = 0, required = false } = {}) {
-  return [
-    `Reminder: to call a tool, emit ${OPEN}{"name": "...", "arguments": {...}}${CLOSE} - `
-    + 'valid JSON, quotes and backslashes escaped, never inside a code fence.',
-    budgetChars ? `Keep this reply under ${budgetChars} characters.` : '',
-    required
-      ? 'Answer the user\'s most recent request by calling a tool. Do not answer in prose.'
-      : 'Now answer the user\'s most recent request, calling tools only if they are needed.',
-  ].filter(Boolean).join('\n');
+/** Inject the tool protocol into the outgoing message list. */
+function injectToolPrompt(messages, tools) {
+  if (!tools?.length) return messages;
+  const prompt = buildToolPrompt(tools);
+  const first = messages[0];
+  if (first?.role === 'system' && typeof first.content === 'string') {
+    return [{ ...first, content: `${first.content}\n\n${prompt}` }, ...messages.slice(1)];
+  }
+  return [{ role: 'system', content: prompt }, ...messages];
 }
 
 /**
@@ -363,8 +317,8 @@ class ToolCallScanner {
 
 module.exports = {
   buildToolPrompt,
-  buildToolReminder,
   budgetFor,
+  injectToolPrompt,
   ToolCallScanner,
   hasOpenToolCall,
   restartsToolCall,

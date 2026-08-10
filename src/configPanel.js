@@ -40,11 +40,7 @@ function openConfigPanel(context, provider) {
       identity: JSON.stringify(getPrivate(context, 'identity', {}), null, 2),
       params: JSON.stringify(getPrivate(context, 'params', {}), null, 2),
       maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
-      // 20, matching package.json and provider.js. It read 8 here, so the panel
-      // showed 8 while 20 was running, and opening the panel and saving silently
-      // cut the longest recoverable answer to 40% of what it had been.
-      maxContinuations: readSetting(context, 'maxContinuations', 20),
-      contextChars: readSetting(context, 'contextChars', 400000),
+      maxContinuations: readSetting(context, 'maxContinuations', 8),
     });
   };
 
@@ -100,8 +96,7 @@ function openConfigPanel(context, provider) {
           servedModelPath,
           logRequestBody,
           maxResponseChars: Number(msg.maxResponseChars) || 5000,
-          maxContinuations: Number(msg.maxContinuations) || 20,
-          contextChars: Number(msg.contextChars) || 400000,
+          maxContinuations: Number(msg.maxContinuations) || 8,
         }));
 
         const token = await getToken(context);
@@ -352,7 +347,7 @@ function html(webview) {
 
   <div class="grid">
     <div>
-      <label>Response char cap <span class="hint">— the model is asked to stay 500 under it</span></label>
+      <label>Response char cap</label>
       <input id="maxResponseChars" type="number" min="0" />
     </div>
     <div>
@@ -360,9 +355,6 @@ function html(webview) {
       <input id="maxContinuations" type="number" min="0" />
     </div>
   </div>
-
-  <label>Prompt char budget <span class="hint">— how much the backend accepts in one request; VS Code fills it, and an over-estimate is truncated from the START, losing the tool definitions</span></label>
-  <input id="contextChars" type="number" min="0" />
 
   <div class="actions">
     <button id="save">Save &amp; Test</button>
@@ -392,7 +384,6 @@ function html(webview) {
       $('params').value = m.params === '{}' ? '' : m.params;
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
-      $('contextChars').value = m.contextChars;
       $('saved').textContent = m.tokenLocation
         ? 'Token saved in ' + m.tokenLocation + '. Leave blank to keep it.'
         : 'No token saved yet.';
@@ -428,7 +419,6 @@ function html(webview) {
       modelField: $('modelField').value,
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
-      contextChars: $('contextChars').value,
     });
     $('token').value = '';
     $('cookie').value = '';

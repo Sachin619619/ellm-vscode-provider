@@ -16,27 +16,6 @@ const CONTINUE_INSTRUCTION = [
   '- If you stopped mid-word or mid-line, resume mid-word.',
 ].join('\n');
 
-/**
- * The same request, for an answer that stopped inside an unfinished tool call.
- *
- * The prose instruction above is the wrong thing to hand a model stranded mid-JSON:
- * "resume mid-word" reads as advice about writing, so the model tidies up by
- * starting the call again from the top. That restart is the corruption
- * `restartsToolCall` exists to clean up after - and cleaning up after it still
- * costs the whole half it threw away, plus a round trip. Naming the situation and
- * asking for raw JSON prevents most of them instead.
- */
-const CONTINUE_TOOL_CALL_INSTRUCTION = [
-  'Your previous response stopped in the middle of a tool call, inside the JSON.',
-  '',
-  '- Continue the JSON from the exact character it stopped at.',
-  '- Do NOT start the tool call again, and do NOT repeat any of it.',
-  `- Do NOT write ${'<tool_call>'} again - that tag is already open.`,
-  '- Write raw JSON only: no prose, no preamble, no code fence.',
-  `- Finish the JSON object and then close it with ${'</tool_call>'}.`,
-  '- Remember to escape " as \\" and \\ as \\\\ inside strings.',
-].join('\n');
-
 /** Chars of a continuation buffered before emitting, so overlap can be removed. */
 const HEAD_WINDOW = 400;
 
@@ -114,18 +93,11 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
     // Round 0 streams straight through; later rounds buffer a head window to de-dup.
     let head = round === 0 ? null : '';
 
-    // Which of the two continuation requests to send depends on where the answer
-    // stopped, and `needsMore` is exactly the test for "stopped inside a call".
     const turns = round === 0
       ? baseTurns
       : [...baseTurns,
         { speaker: 'assistant', utterance: full },
-        {
-          speaker: 'human',
-          utterance: opts.needsMore?.(full)
-            ? CONTINUE_TOOL_CALL_INSTRUCTION
-            : CONTINUE_INSTRUCTION,
-        }];
+        { speaker: 'human', utterance: CONTINUE_INSTRUCTION }];
 
     for await (const ev of callRound(turns, signal)) {
       if (ev.type === 'finish') {
@@ -212,11 +184,4 @@ async function* withContinuation(callRound, baseTurns, opts = {}) {
   yield { type: 'finish', reason: 'stop', text: full };
 }
 
-module.exports = {
-  withContinuation,
-  stripOverlap,
-  stripPreamble,
-  insideFence,
-  CONTINUE_INSTRUCTION,
-  CONTINUE_TOOL_CALL_INSTRUCTION,
-};
+module.exports = { withContinuation, stripOverlap, stripPreamble, insideFence, CONTINUE_INSTRUCTION };

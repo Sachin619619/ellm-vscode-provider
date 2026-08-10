@@ -8,8 +8,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const {
-  ToolCallScanner, buildToolPrompt, buildToolReminder, budgetFor, restartsToolCall,
-  dropOpenToolCall,
+  ToolCallScanner, buildToolPrompt, restartsToolCall, dropOpenToolCall,
 } = require('../src/toolshim');
 
 /** Feed text through the scanner one chunk at a time, as a stream would. */
@@ -276,86 +275,14 @@ test('the scanner forgets an abandoned call instead of splicing it onto the new 
   assert.deepStrictEqual(scanner.flush(), { text: '', calls: [] });
 });
 
-// --- what the prompt asks for -----------------------------------------------
+// --- the response budget ----------------------------------------------------
+// Everything else about the upstream cap recovers from it AFTER the fact: the
+// continuation layer stitches the halves, dropOpenToolCall drops a restarted call,
+// the JSON repair fixes what a cut left behind. Nothing told the model the limit
+// existed, so it wrote to no budget and was guillotined mid-JSON on any real file.
 
-/**
- * Serialising every call cost a full round trip each - through a capped, stitched
- * transport - and that is most of why a task took many more turns here than on a
- * model with native tool calling. The permission to batch has to survive edits to
- * the prompt, so it is pinned.
- */
-test('the tool prompt allows independent calls to be batched into one reply', () => {
-  const prompt = buildToolPrompt([{ name: 'read_file', description: 'read', parameters: {} }]);
-  assert.match(prompt, /emit them all in one reply/i);
-  assert.doesNotMatch(prompt, /one tool call at a time/i);
-});
-
-test('a dependent call, and a call carrying a file, are still sent alone', () => {
-  const prompt = buildToolPrompt([{ name: 'create_file', description: 'write', parameters: {} }]);
-  assert.match(prompt, /depends on what it returns/i);
-  assert.match(prompt, /large file body/i);
-});
-
-/**
- * Required means the caller cannot use prose: it is waiting for a call and treats
- * an answer as a failed turn. Before this the mode was read nowhere.
- */
-test('tool mode Required tells the model it must call a tool', () => {
-  const prompt = buildToolPrompt([{ name: 'edit', description: '', parameters: {} }], { required: true });
-  assert.match(prompt, /MUST call a tool/);
-  assert.doesNotMatch(prompt, /just answer normally/i);
-});
-
-test('without Required the model may still answer in prose', () => {
-  const prompt = buildToolPrompt([{ name: 'edit', description: '', parameters: {} }]);
-  assert.match(prompt, /just answer normally/i);
-  assert.doesNotMatch(prompt, /MUST call a tool/);
-});
-
-/**
- * The prompt is appended after the whole conversation, so it is the last thing the
- * model reads. That is why calls come back well-formed - and why it has to hand
- * attention back, or a model given a tool manual as the final word reaches for a
- * tool when it should simply answer.
- */
-/**
- * The schemas sit at the front and must not claim which message is the request. Two
- * releases were lost to exactly that claim: "the request is above" (it had been
- * truncated away) and "the request is the message that follows" (in an agent round
- * the next message is a tool result, so the model answered the protocol instead).
- */
-test('the schema block never claims which message is the request', () => {
-  const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
-  assert.match(prompt.trim().split('\n').pop(), /conversation follows/i);
-  assert.doesNotMatch(prompt, /request above/i);
-  assert.doesNotMatch(prompt, /message that follows is the request/i);
-});
-
-/**
- * The anchor goes last, so it has to stay small: being large is precisely what made
- * the full protocol unusable in that position.
- */
-test('the trailing reminder is small enough to displace nothing', () => {
-  const reminder = buildToolReminder({ budgetChars: 4500 });
-  assert.ok(reminder.length < 400, `reminder is ${reminder.length} chars`);
-  assert.match(reminder, /<tool_call>/);
-  assert.match(reminder, /under 4500 characters/);
-  assert.match(reminder, /most recent request/i);
-});
-
-test('the reminder carries the Required mode through to the last thing read', () => {
-  assert.match(buildToolReminder({ required: true }), /Do not answer in prose/i);
-  assert.doesNotMatch(buildToolReminder({}), /Do not answer in prose/i);
-});
-
-/**
- * Everything else about the cap recovers AFTER a truncation - stitching the halves,
- * dropping a restarted call, repairing the JSON left behind. Nothing told the model
- * the limit existed, so it wrote to no budget and was guillotined mid-JSON on every
- * sizeable file. These pin the one rule that tries to prevent it.
- */
 test('the model is given a budget under the cap, not the cap itself', () => {
-  // Aiming at the cap overshoots it; the number the model sees has to be the lower one.
+  const { budgetFor } = require('../src/toolshim');
   assert.strictEqual(budgetFor(5000), 4500);
   const prompt = buildToolPrompt([{ name: 'create_file', description: '', parameters: {} }], {
     budgetChars: budgetFor(5000),
@@ -365,42 +292,24 @@ test('the model is given a budget under the cap, not the cap itself', () => {
 });
 
 test('the budget tracks a backend configured with a different cap', () => {
+  const { budgetFor } = require('../src/toolshim');
   assert.strictEqual(budgetFor(8000), 7500);
-  assert.match(
-    buildToolPrompt([{ name: 'x' }], { budgetChars: budgetFor(8000) }),
-    /under 7500 characters/,
-  );
-});
-
-/**
- * A margin bigger than the cap would otherwise produce a zero or negative budget and
- * tell the model to write nothing.
- */
-test('a cap smaller than the margin still leaves a usable budget', () => {
   assert.strictEqual(budgetFor(600), 300);
   assert.strictEqual(budgetFor(0), 0);
 });
 
-/**
- * The content allowance has to sit below the reply budget: escaping expands a file on
- * its way into a JSON string, so a body measured at the full budget crosses the cap
- * once the quotes and backslashes are doubled.
- */
 test('a large file is split across calls, with room left for escaping', () => {
   const prompt = buildToolPrompt([{ name: 'create_file', description: '', parameters: {} }], {
     budgetChars: 4500,
   });
   assert.match(prompt, /must NEVER be cut off/i);
   assert.match(prompt, /about 3150 characters of file content/);
-  assert.match(prompt, /wait for the result, then add each further part/i);
   assert.match(prompt, /Escaping makes the JSON longer/i);
 });
 
-/** Without a budget the rules must vanish rather than print "under 0 characters". */
-test('no budget means no budget rules', () => {
+test('no budget means no budget rules, and the rest of the protocol is unchanged', () => {
   const prompt = buildToolPrompt([{ name: 'x' }]);
-  assert.doesNotMatch(prompt, /characters of file content/);
   assert.doesNotMatch(prompt, /Keep each reply under/);
-  // The rest of the protocol is unaffected.
-  assert.match(prompt, /emit them all in one reply/i);
+  assert.match(prompt, /one tool call at a time/);
+  assert.match(prompt, /just answer normally/);
 });
