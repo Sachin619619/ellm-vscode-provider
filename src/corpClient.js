@@ -449,6 +449,59 @@ async function failureFor(res, url, client) {
   return new Error(`Enterprise LLM returned ${where}${snippet ? `: ${snippet}` : ''}`);
 }
 
+/** Marks where dropped history was, so the model knows the gap is deliberate. */
+const OMITTED_NOTE = '[earlier conversation omitted to fit the context limit]';
+
+/**
+ * Drop old turns until the conversation fits, oldest first.
+ *
+ * The backend truncates an over-length prompt from the FRONT. That was survivable
+ * while the tool protocol sat at the front and the request at the back - the protocol
+ * was what got eaten. Once the protocol moved to the back for anchoring, the front was
+ * the request itself, and the model received a tool manual ending in "answer the most
+ * recent request above" with nothing above it. It answered the only way it could: that
+ * it could not see a request.
+ *
+ * So the trim happens here, where which turns matter is known. The final turn is never
+ * dropped (it is the request), and neither is a trailing system turn (the protocol).
+ * Everything else is history, and history is what a context limit is for spending.
+ */
+function fitTurns(turns, budget, { onTrim } = {}) {
+  if (!budget || budget <= 0 || !Array.isArray(turns) || turns.length < 2) return turns;
+
+  const size = (t) => String(t?.utterance ?? '').length + 12; // + "Assistant: " and the blank line
+  const total = (list) => list.reduce((n, t) => n + size(t), 0);
+  if (total(turns) <= budget) return turns;
+
+  // Anything the model must still be holding when it starts writing.
+  const keepFrom = turns.length - (turns[turns.length - 2]?.speaker === 'system' ? 2 : 1);
+  const protectedTurns = turns.slice(keepFrom);
+  const history = turns.slice(0, keepFrom);
+
+  // Newest history first, so what survives is what was said most recently.
+  const room = budget - total(protectedTurns) - OMITTED_NOTE.length - 12;
+  const kept = [];
+  let used = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const cost = size(history[i]);
+    if (used + cost > room) break;
+    used += cost;
+    kept.unshift(history[i]);
+  }
+
+  const dropped = history.length - kept.length;
+  if (dropped > 0) {
+    onTrim?.(`prompt over ${budget} chars - dropped ${dropped} of ${turns.length} turn(s). `
+      + 'Lower ellm.contextChars if the backend still truncates, raise it if this is cutting '
+      + 'useful history.');
+    // A protected pair alone can still exceed the budget - one huge file in the last
+    // turn. Nothing can be dropped then without losing the request, so it goes as is
+    // and the note above is the only warning there will be.
+    return [{ speaker: 'system', utterance: OMITTED_NOTE }, ...kept, ...protectedTurns];
+  }
+  return turns;
+}
+
 class CorpClient {
   constructor({
     url, token, authHeader, authPrefix, cookie, chatPath, promptField, modelField,
@@ -520,16 +573,20 @@ class CorpClient {
    * itself, keyed by conversation id. VS Code already replays the whole
    * conversation every turn, so history is flattened in here and server-side
    * memory is left off; otherwise every turn would be remembered twice.
+   *
+   * Over-length prompts are trimmed HERE rather than left to the backend, which
+   * truncates from the front and would take the request itself. `contextChars` was
+   * only ever advertised to VS Code as a token budget; nothing enforced it on the
+   * way out, so a conversation that outgrew the backend arrived decapitated.
    */
-  toPrompt(turns) {
+  toPrompt(turns, { onTrim } = {}) {
     const label = { system: 'System', human: 'User', assistant: 'Assistant' };
     if (turns.length === 1) return turns[0].utterance ?? '';
-    return turns
-      .map((t) => `${label[t.speaker] ?? 'User'}: ${t.utterance ?? ''}`)
-      .join('\n\n');
+    const render = (t) => `${label[t.speaker] ?? 'User'}: ${t.utterance ?? ''}`;
+    return fitTurns(turns, this.contextChars, { onTrim }).map(render).join('\n\n');
   }
 
-  body({ modelAlias, turns }) {
+  body({ modelAlias, turns, onTrim }) {
     return {
       ...this.identity, // whatever extra fields the backend expects, verbatim
       ...this.params, // tuning knobs, exactly as configured
@@ -537,7 +594,7 @@ class CorpClient {
       // extra fields. It cannot win over a *differently named* field, which is
       // what modelFieldConflicts is for.
       [this.modelField]: modelAlias || this.model,
-      [this.promptField]: this.toPrompt(turns),
+      [this.promptField]: this.toPrompt(turns, { onTrim }),
       stream: true,
     };
   }
@@ -570,12 +627,12 @@ class CorpClient {
    * attempt would duplicate them. So this returns the response and never touches
    * the stream - a mid-stream failure stays fatal, correctly.
    */
-  async fetchWithRetry({ modelAlias, turns, signal, onRetry }) {
+  async fetchWithRetry({ modelAlias, turns, signal, onRetry, onTrim }) {
     const url = this.endpoint;
     const init = {
       method: 'POST',
       headers: this.headers(),
-      body: JSON.stringify(this.body({ modelAlias, turns })),
+      body: JSON.stringify(this.body({ modelAlias, turns, onTrim })),
       signal,
     };
 
@@ -618,10 +675,11 @@ class CorpClient {
   /** Yields { type:'text', text } then a final { type:'finish', reason }. */
   async *converse({
     modelAlias, turns, signal, onRawFrame, onServedModel, onFrameProblem, onRequest, onRetry,
+    onTrim,
   }) {
     const url = this.endpoint;
     if (onRequest) onRequest(this.requestShape({ modelAlias, turns }));
-    const res = await this.fetchWithRetry({ modelAlias, turns, signal, onRetry });
+    const res = await this.fetchWithRetry({ modelAlias, turns, signal, onRetry, onTrim });
 
     if (!res.ok) throw await failureFor(res, url, this);
     if (!res.body) throw new Error(`${url} answered ${res.status} with no body to stream.`);
@@ -800,6 +858,7 @@ class CorpClient {
 }
 
 module.exports = {
+  fitTurns,
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
   salvageText, stripPadding, isTransportEnvelope, retryAfterMs,
   modelFieldConflicts, describeConflict, normalizeModel, describeRequest,

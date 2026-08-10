@@ -317,9 +317,15 @@ test('without Required the model may still answer in prose', () => {
  * attention back, or a model given a tool manual as the final word reaches for a
  * tool when it should simply answer.
  */
-test('the tool prompt ends by pointing back at the conversation', () => {
+/**
+ * The protocol sits second to last, so the request FOLLOWS it. It used to say
+ * "above", which pointed the model back over its own tool schemas - and on a prompt
+ * the backend had truncated from the front, at nothing at all.
+ */
+test('the tool prompt ends by pointing forward at the request', () => {
   const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
-  assert.match(prompt.trim().split('\n').pop(), /most recent request above/i);
+  assert.match(prompt.trim().split('\n').pop(), /message that follows is the request/i);
+  assert.doesNotMatch(prompt, /request above/i);
 });
 
 /**

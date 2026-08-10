@@ -10,7 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
-  salvageText, stripPadding, modelFieldConflicts, describeRequest, retryAfterMs,
+  salvageText, stripPadding, modelFieldConflicts, describeRequest, retryAfterMs, fitTurns,
 } = require('../src/corpClient');
 const { repairJson, parseLenient } = require('../src/jsonRepair');
 
@@ -867,4 +867,73 @@ test('Retry-After is read as seconds, as a date, or not at all', () => {
   const soon = new Date(Date.now() + 3000).toUTCString();
   const ms = retryAfterMs({ headers: { get: () => soon } });
   assert.ok(ms > 1000 && ms <= 3000, `date form gave ${ms}`);
+});
+
+/**
+ * The backend truncates an over-length prompt from the FRONT, so whatever is first
+ * is what disappears. With the protocol appended last (v0.4.0) the request was
+ * first, and the model received a tool manual with no request attached - it replied
+ * that it could not see a question. The trim happens here now, where which turns
+ * matter is known.
+ */
+test('an over-length conversation drops old history, never the request', () => {
+  const big = (n, who) => ({ speaker: who, utterance: 'x'.repeat(n) });
+  const turns = [
+    big(400, 'human'), big(400, 'assistant'), big(400, 'human'), big(400, 'assistant'),
+    { speaker: 'system', utterance: 'TOOL PROTOCOL' },
+    { speaker: 'human', utterance: 'THE ACTUAL REQUEST' },
+  ];
+  const notes = [];
+  const kept = fitTurns(turns, 900, { onTrim: (m) => notes.push(m) });
+
+  const text = kept.map((t) => t.utterance).join('|');
+  assert.match(text, /THE ACTUAL REQUEST/);
+  assert.match(text, /TOOL PROTOCOL/);
+  assert.match(text, /earlier conversation omitted/);
+  assert.ok(kept.length < turns.length, 'something was dropped');
+  assert.strictEqual(notes.length, 1, 'the drop was reported exactly once');
+});
+
+test('a conversation that already fits is returned untouched', () => {
+  const turns = [
+    { speaker: 'human', utterance: 'hello' },
+    { speaker: 'system', utterance: 'TOOL PROTOCOL' },
+    { speaker: 'human', utterance: 'the request' },
+  ];
+  const notes = [];
+  assert.strictEqual(fitTurns(turns, 100000, { onTrim: (m) => notes.push(m) }), turns);
+  assert.strictEqual(notes.length, 0);
+});
+
+/**
+ * Nothing can be dropped without losing the request itself, so it goes out whole and
+ * the log line is the only warning. Silently sending an empty prompt would be worse.
+ */
+test('a request too big for the budget is still sent, with a warning', () => {
+  const turns = [
+    { speaker: 'human', utterance: 'old' },
+    { speaker: 'human', utterance: 'y'.repeat(5000) },
+  ];
+  const notes = [];
+  const kept = fitTurns(turns, 500, { onTrim: (m) => notes.push(m) });
+  assert.match(kept[kept.length - 1].utterance, /^y+$/);
+  assert.strictEqual(notes.length, 1);
+});
+
+test('the newest history survives, not the oldest', () => {
+  const turns = [
+    { speaker: 'human', utterance: `OLDEST ${'x'.repeat(300)}` },
+    { speaker: 'human', utterance: `NEWEST ${'x'.repeat(300)}` },
+    { speaker: 'human', utterance: 'the request' },
+  ];
+  const text = fitTurns(turns, 500, {}).map((t) => t.utterance).join('|');
+  assert.match(text, /NEWEST/);
+  assert.doesNotMatch(text, /OLDEST/);
+});
+
+/** With no budget configured the conversation must pass through unchanged. */
+test('a zero or missing budget disables trimming', () => {
+  const turns = [{ speaker: 'human', utterance: 'a' }, { speaker: 'human', utterance: 'b' }];
+  assert.strictEqual(fitTurns(turns, 0, {}), turns);
+  assert.strictEqual(fitTurns(turns, undefined, {}), turns);
 });

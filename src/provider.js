@@ -169,16 +169,26 @@ class EllmChatProvider {
     const budget = budgetFor(cap);
 
     const turns = this.toTurns(messages, shimming);
-    // Appended, not prepended. The protocol used to open the prompt, which put it
-    // behind the whole conversation - by the time the model was writing, the rules
-    // for the tags it had to emit were thousands of characters back, and malformed
-    // calls were the routine result. Last position is also after every TOOL RESULT
-    // turn, so it re-anchors itself on each round of an agent loop.
+    // Second to last, not last, and not first.
+    //
+    // First (before v0.4.0) put the protocol behind the whole conversation, so the
+    // rules for the tags were thousands of characters from where the model started
+    // writing, and malformed calls were routine. Last fixed that and broke something
+    // worse: the protocol runs to ~12k chars with a real tool list, so it pushed the
+    // request to the very front of the prompt - which is the end the backend truncates.
+    // The model got a tool manual ending in "answer the most recent request above"
+    // with nothing above it, and said, correctly, that it saw no request.
+    //
+    // Here it keeps the anchoring - it still sits right beside where writing starts,
+    // after every TOOL RESULT turn - while the request stays last, both for the model
+    // and for anything downstream that trims from the front.
     if (shimming) {
-      turns.push({
+      const protocol = {
         speaker: 'system',
         utterance: buildToolPrompt(tools, { required, budgetChars: budget }),
-      });
+      };
+      if (turns.length) turns.splice(turns.length - 1, 0, protocol);
+      else turns.push(protocol);
     }
     if (shimming) {
       this.log(`${tools.length} tool(s) offered${required ? ', tool call REQUIRED' : ''}`
@@ -215,6 +225,11 @@ class EllmChatProvider {
         // A retry is invisible to the user by design, so the log is the only place
         // a flaky gateway shows up as flaky rather than as a slow model.
         onRetry: (msg) => this.log(`retrying: ${msg}`),
+        // Dropping history is a decision made on the user's behalf about what the
+        // model is allowed to remember. It happens silently in the chat, so the log
+        // is the only place it is visible - and it is the first thing to look at
+        // when the model starts answering as if it had lost the thread.
+        onTrim: (msg) => this.log(`prompt trimmed: ${msg}`),
       });
 
       const stream = withContinuation(rounds, turns, {

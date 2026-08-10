@@ -114,9 +114,13 @@ function buildToolPrompt(tools, { required = false, budgetChars = 0 } = {}) {
       ? '- You MUST call a tool in this reply. Do not answer in prose.'
       : '- If no tool is needed, just answer normally in plain text.',
     '',
+    // The protocol is inserted second to last, so the request follows it rather than
+    // preceding it. Pointing the model "above" from here sent it looking at the tool
+    // schemas - and on a truncated prompt, at nothing at all.
     required
-      ? 'Now call the tool needed for the most recent request above.'
-      : 'Now answer the most recent request above, calling tools only if they are needed.',
+      ? 'The message that follows is the request. Call the tool it needs.'
+      : 'The message that follows is the request. Answer it, calling tools only if '
+      + 'they are needed.',
   ].join('\n');
 }
 
