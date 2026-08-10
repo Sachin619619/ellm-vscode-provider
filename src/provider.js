@@ -2,7 +2,8 @@ const vscode = require('vscode');
 const { CorpClient, CorpAuthError, describeConflict, describeRequest } = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const {
-  buildToolPrompt, ToolCallScanner, hasOpenToolCall, restartsToolCall, dropOpenToolCall,
+  buildToolPrompt, budgetFor, ToolCallScanner, hasOpenToolCall, restartsToolCall,
+  dropOpenToolCall,
 } = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
 
@@ -161,6 +162,12 @@ class EllmChatProvider {
     const required = shimming && Mode?.Required !== undefined
       && options?.toolMode === Mode.Required;
 
+    // Read once and used twice: the budget the model is told about and the cap the
+    // continuation layer recovers from have to come from the same number, or the
+    // model is aiming at a limit that is not the one being enforced.
+    const cap = readSetting(this.context, 'maxResponseChars', 5000);
+    const budget = budgetFor(cap);
+
     const turns = this.toTurns(messages, shimming);
     // Appended, not prepended. The protocol used to open the prompt, which put it
     // behind the whole conversation - by the time the model was writing, the rules
@@ -168,9 +175,15 @@ class EllmChatProvider {
     // calls were the routine result. Last position is also after every TOOL RESULT
     // turn, so it re-anchors itself on each round of an agent loop.
     if (shimming) {
-      turns.push({ speaker: 'system', utterance: buildToolPrompt(tools, { required }) });
+      turns.push({
+        speaker: 'system',
+        utterance: buildToolPrompt(tools, { required, budgetChars: budget }),
+      });
     }
-    if (shimming) this.log(`${tools.length} tool(s) offered${required ? ', tool call REQUIRED' : ''}`);
+    if (shimming) {
+      this.log(`${tools.length} tool(s) offered${required ? ', tool call REQUIRED' : ''}`
+        + `, reply budget ${budget} chars (cap ${cap})`);
+    }
 
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());
@@ -205,7 +218,7 @@ class EllmChatProvider {
       });
 
       const stream = withContinuation(rounds, turns, {
-        maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
+        maxResponseChars: cap,
         maxContinuations: readSetting(this.context, 'maxContinuations', 20),
         // A file written through a 5000-char cap arrives over many rounds, and a
         // backend that reports a clean stop for a capped response would otherwise

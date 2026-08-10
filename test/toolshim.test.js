@@ -8,7 +8,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const {
-  ToolCallScanner, buildToolPrompt, restartsToolCall, dropOpenToolCall,
+  ToolCallScanner, buildToolPrompt, budgetFor, restartsToolCall, dropOpenToolCall,
 } = require('../src/toolshim');
 
 /** Feed text through the scanner one chunk at a time, as a stream would. */
@@ -320,4 +320,61 @@ test('without Required the model may still answer in prose', () => {
 test('the tool prompt ends by pointing back at the conversation', () => {
   const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
   assert.match(prompt.trim().split('\n').pop(), /most recent request above/i);
+});
+
+/**
+ * Everything else about the cap recovers AFTER a truncation - stitching the halves,
+ * dropping a restarted call, repairing the JSON left behind. Nothing told the model
+ * the limit existed, so it wrote to no budget and was guillotined mid-JSON on every
+ * sizeable file. These pin the one rule that tries to prevent it.
+ */
+test('the model is given a budget under the cap, not the cap itself', () => {
+  // Aiming at the cap overshoots it; the number the model sees has to be the lower one.
+  assert.strictEqual(budgetFor(5000), 4500);
+  const prompt = buildToolPrompt([{ name: 'create_file', description: '', parameters: {} }], {
+    budgetChars: budgetFor(5000),
+  });
+  assert.match(prompt, /under 4500 characters/);
+  assert.doesNotMatch(prompt, /under 5000 characters/);
+});
+
+test('the budget tracks a backend configured with a different cap', () => {
+  assert.strictEqual(budgetFor(8000), 7500);
+  assert.match(
+    buildToolPrompt([{ name: 'x' }], { budgetChars: budgetFor(8000) }),
+    /under 7500 characters/,
+  );
+});
+
+/**
+ * A margin bigger than the cap would otherwise produce a zero or negative budget and
+ * tell the model to write nothing.
+ */
+test('a cap smaller than the margin still leaves a usable budget', () => {
+  assert.strictEqual(budgetFor(600), 300);
+  assert.strictEqual(budgetFor(0), 0);
+});
+
+/**
+ * The content allowance has to sit below the reply budget: escaping expands a file on
+ * its way into a JSON string, so a body measured at the full budget crosses the cap
+ * once the quotes and backslashes are doubled.
+ */
+test('a large file is split across calls, with room left for escaping', () => {
+  const prompt = buildToolPrompt([{ name: 'create_file', description: '', parameters: {} }], {
+    budgetChars: 4500,
+  });
+  assert.match(prompt, /must NEVER be cut off/i);
+  assert.match(prompt, /about 3150 characters of file content/);
+  assert.match(prompt, /wait for the result, then add each further part/i);
+  assert.match(prompt, /Escaping makes the JSON longer/i);
+});
+
+/** Without a budget the rules must vanish rather than print "under 0 characters". */
+test('no budget means no budget rules', () => {
+  const prompt = buildToolPrompt([{ name: 'x' }]);
+  assert.doesNotMatch(prompt, /characters of file content/);
+  assert.doesNotMatch(prompt, /Keep each reply under/);
+  // The rest of the protocol is unaffected.
+  assert.match(prompt, /emit them all in one reply/i);
 });

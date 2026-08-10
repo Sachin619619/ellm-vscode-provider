@@ -40,7 +40,10 @@ function openConfigPanel(context, provider) {
       identity: JSON.stringify(getPrivate(context, 'identity', {}), null, 2),
       params: JSON.stringify(getPrivate(context, 'params', {}), null, 2),
       maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
-      maxContinuations: readSetting(context, 'maxContinuations', 8),
+      // 20, matching package.json and provider.js. It read 8 here, so the panel
+      // showed 8 while 20 was running, and opening the panel and saving silently
+      // cut the longest recoverable answer to 40% of what it had been.
+      maxContinuations: readSetting(context, 'maxContinuations', 20),
       contextChars: readSetting(context, 'contextChars', 400000),
     });
   };
@@ -97,7 +100,7 @@ function openConfigPanel(context, provider) {
           servedModelPath,
           logRequestBody,
           maxResponseChars: Number(msg.maxResponseChars) || 5000,
-          maxContinuations: Number(msg.maxContinuations) || 8,
+          maxContinuations: Number(msg.maxContinuations) || 20,
           contextChars: Number(msg.contextChars) || 400000,
         }));
 
@@ -349,7 +352,7 @@ function html(webview) {
 
   <div class="grid">
     <div>
-      <label>Response char cap</label>
+      <label>Response char cap <span class="hint">— the model is asked to stay 500 under it</span></label>
       <input id="maxResponseChars" type="number" min="0" />
     </div>
     <div>

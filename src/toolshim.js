@@ -24,8 +24,34 @@ const BARE_CALL_START = /^\s*\{\s*"name"\s*:/;
 const MAX_HOLD = 8192;
 
 /**
+ * Headroom left between the backend's hard cap and the budget we ask the model for.
+ *
+ * The cap is enforced by the backend mid-word, with no warning; a model asked to aim
+ * at exactly the cap overshoots it routinely, so the number it is given has to be the
+ * lower one. 500 is enough to absorb a normal overshoot without wasting a useful
+ * fraction of a 5000-char response.
+ */
+const RESPONSE_MARGIN = 500;
+
+/**
+ * Of that budget, how much may be file content inside a call.
+ *
+ * The rest is the JSON envelope plus escaping, and escaping is the part that bites:
+ * a file thick with quotes and backslashes grows on its way into a JSON string, so a
+ * body measured at the full budget crosses the cap once escaped.
+ */
+const CALL_CONTENT_RATIO = 0.7;
+
+/** What to ask the model for, given the backend's hard cap. */
+function budgetFor(cap) {
+  if (!cap || cap <= 0) return 0;
+  return cap > RESPONSE_MARGIN * 2 ? cap - RESPONSE_MARGIN : Math.floor(cap / 2);
+}
+
+/**
  * @param tools     the tool schemas the client offered
  * @param required  the client set toolMode=Required: this reply MUST be a call
+ * @param budgetChars  chars this reply should stay under; 0 omits the budget rules
  *
  * Written to be read LAST, not first - the provider appends it after the whole
  * conversation, so it sits close to where the model starts writing. Hence the closing
@@ -34,7 +60,7 @@ const MAX_HOLD = 8192;
  * thing said, and a model handed a tool manual as the final word will reach for a
  * tool when it should just answer.
  */
-function buildToolPrompt(tools, { required = false } = {}) {
+function buildToolPrompt(tools, { required = false, budgetChars = 0 } = {}) {
   const specs = tools.map((t) => {
     const fn = t.function ?? t;
     return JSON.stringify({
@@ -66,6 +92,22 @@ function buildToolPrompt(tools, { required = false } = {}) {
     '- Emit a call alone, and wait for its result, when the next call depends on what '
     + 'it returns, or when the call carries a large file body.',
     '- Never wrap the tool call in markdown or code fences.',
+    // Everything above this point recovers from the cap after the fact - stitching a
+    // guillotined reply, dropping a restarted call, repairing the JSON a truncation
+    // left behind. This rule is the only one that tries to avoid the truncation, and
+    // it is far cheaper than any of them: a call that fits is never split, so it never
+    // needs repairing.
+    ...(budgetChars ? [
+      `- Keep each reply under ${budgetChars} characters. The backend stops you at a hard `
+      + 'limit just above that, mid-word and without warning. The rest is recovered over '
+      + 'extra round trips, so a reply that fits is both faster and safer.',
+      `- A tool call must NEVER be cut off by that limit. If a call would carry more than `
+      + `about ${Math.floor(budgetChars * CALL_CONTENT_RATIO)} characters of file content, `
+      + 'do not write it as one call: write the first part, wait for the result, then add '
+      + 'each further part with a follow-up edit or append call. Escaping makes the JSON '
+      + 'longer than the content, so leave room.',
+      '- Prefer editing the specific lines that change over rewriting a whole file.',
+    ] : []),
     required
       // Required means the client cannot use prose - it is waiting for a call and
       // will treat an answer as a failed turn.
@@ -289,6 +331,7 @@ class ToolCallScanner {
 
 module.exports = {
   buildToolPrompt,
+  budgetFor,
   ToolCallScanner,
   hasOpenToolCall,
   restartsToolCall,
