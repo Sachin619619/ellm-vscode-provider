@@ -208,6 +208,33 @@ The header the token rides in is the single most common mismatch, and it needs n
 Both are on the config panel. Note that plenty of gateways expect the **raw** token with no
 prefix at all, so an empty prefix is a real answer, not an unfinished one.
 
+## “No utility model is configured for `copilot-utility-small`”
+
+Not this extension. VS Code **1.128** started routing its own small side jobs — chat title
+generation, commit messages, intent detection, the *Optimizing tool selection* pass — to a
+separate **utility model**, and it refuses to guess one when the main agent model is BYOK,
+which every model this extension serves is. On a machine with a live Copilot token the
+default quietly resolves to Copilot's own utility models and nothing is ever said; without
+one, the very first agent turn fails with that line. That is the whole difference between the
+laptop where it works and the laptop where it does not — the extension, the token and the URL
+are irrelevant to it.
+
+Set one setting:
+
+| setting | value | effect |
+|---|---|---|
+| `chat.byokUtilityModelDefault` | `mainAgent` | side jobs go to the enterprise LLM you already picked |
+| `chat.byokUtilityModelDefault` | `copilot` | side jobs go to GitHub Copilot — only if that account has a token |
+| `chat.byokUtilityModelDefault` | `none` *(default)* | no utility model, and agent mode fails as above |
+
+In the UI it is **Settings → Chat: Byok Utility Model Default → Main Agent Model**. If
+`chat.utilityModel` or `chat.utilitySmallModel` was set by hand earlier, reset both to
+*Default* — a named model there outranks this setting.
+
+`mainAgent` sends those side jobs through the same capped, chat-only backend as everything
+else, so a title or a commit message costs a real round trip. That is the price of not having
+a second model; it is not a malfunction.
+
 ## Adapting it to your LLM
 
 Open your company chat UI → DevTools → Network → send a message → find the request that
