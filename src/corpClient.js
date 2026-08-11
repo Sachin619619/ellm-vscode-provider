@@ -332,6 +332,13 @@ function describeRequest({ url, body, headers, promptField }, { values = true } 
       return `<prompt, ${len} chars, hidden>`;
     }
     if (typeof value !== 'string') return value; // a credential is never a number
+    // An inlined screenshot is ~200k characters of base64. Printed in full it
+    // buries every other field and makes this view useless for the one job it
+    // has, so it is summarised by shape rather than by field name.
+    if (value.startsWith('data:')) {
+      const kind = value.slice(5).split(/[;,]/)[0] || 'data';
+      return `<${kind}, ${value.length} chars, hidden>`;
+    }
     if (TOKEN_LIMIT_KEY.test(key)) return value;
     if (SECRET_KEY_HINT.test(normaliseKey(key))) return `<${value.length} chars, hidden>`;
     return value;
@@ -427,7 +434,7 @@ class CorpClient {
   constructor({
     url, token, authHeader, authPrefix, cookie, chatPath, promptField, modelField,
     model, models, identity, params, textPath, servedModelPath,
-    contextChars, maxResponseChars,
+    contextChars, maxResponseChars, imageField,
   } = {}) {
     // Which body key carries the prompt is the backend's business, not this file's.
     this.promptField = promptField || DEFAULT_PROMPT_FIELD;
@@ -447,6 +454,10 @@ class CorpClient {
     this.params = params || {};
     this.textPath = textPath || '';
     this.servedModelPath = servedModelPath || '';
+    // Empty means this backend takes text only. Attached images are then named in
+    // the prompt rather than sent, because a model that is handed a question about
+    // a picture it never received answers it anyway - see toPrompt.
+    this.imageField = imageField || '';
     this.contextChars = contextChars || 400000;
     this.maxResponseChars = maxResponseChars || 5000;
   }
@@ -495,13 +506,41 @@ class CorpClient {
    */
   toPrompt(turns) {
     const label = { system: 'System', human: 'User', assistant: 'Assistant' };
-    if (turns.length === 1) return turns[0].utterance ?? '';
+    if (turns.length === 1) return this.utteranceOf(turns[0]);
     return turns
-      .map((t) => `${label[t.speaker] ?? 'User'}: ${t.utterance ?? ''}`)
+      .map((t) => `${label[t.speaker] ?? 'User'}: ${this.utteranceOf(t)}`)
       .join('\n\n');
   }
 
+  /**
+   * One turn's text, with any image it carried accounted for.
+   *
+   * An image that cannot be sent must still be mentioned. Dropping it silently
+   * leaves the model reading "what does this say?" with nothing attached, and a
+   * model in that position does not say it saw no image - it invents a plausible
+   * one. Naming the attachment is what turns a confident fabrication into "you
+   * sent me an image I cannot read".
+   */
+  utteranceOf(turn) {
+    const text = turn?.utterance ?? '';
+    const images = turn?.images ?? [];
+    if (!images.length || this.imageField) return text;
+
+    const note = images.map((img) => `[attached image: ${img.mimeType || 'image'}, `
+      + `${Math.max(1, Math.round((img.data?.length ?? 0) * 0.75 / 1024))} KB. This endpoint `
+      + 'cannot receive images, so it was NOT sent - you cannot see it. Say so; do not guess '
+      + 'at its contents.]').join('\n');
+    return text ? `${text}\n${note}` : note;
+  }
+
+  /** Every image across the conversation, in order, as the backend wants them. */
+  imagesIn(turns) {
+    return (turns ?? []).flatMap((t) => t.images ?? [])
+      .map((img) => `data:${img.mimeType || 'image/png'};base64,${img.data}`);
+  }
+
   body({ modelAlias, turns }) {
+    const images = this.imageField ? this.imagesIn(turns) : [];
     return {
       ...this.identity, // whatever extra fields the backend expects, verbatim
       ...this.params, // tuning knobs, exactly as configured
@@ -510,6 +549,7 @@ class CorpClient {
       // what modelFieldConflicts is for.
       [this.modelField]: modelAlias || this.model,
       [this.promptField]: this.toPrompt(turns),
+      ...(images.length ? { [this.imageField]: images } : {}),
       stream: true,
     };
   }

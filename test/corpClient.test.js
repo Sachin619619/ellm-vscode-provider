@@ -743,3 +743,79 @@ test('configuration that merely looks credential-ish stays visible', () => {
   assert.match(shown, /"assignee": "team-b"/);
   assert.match(shown, /"max_tokens": 4096/);
 });
+
+// --- attached images ---------------------------------------------------------
+//
+// The failure this guards against is not an error, it is a confident wrong
+// answer: with no image field configured the picture cannot be sent, and a model
+// handed the caption alone describes an image it never received.
+
+const shot = { mimeType: 'image/png', data: 'aGVsbG8=' };
+
+test('images go in the configured body field as data URLs', () => {
+  const body = client({ imageField: 'attachments' }).body({
+    modelAlias: 'm',
+    turns: [{ speaker: 'human', utterance: 'what is this?', images: [shot] }],
+  });
+
+  assert.deepStrictEqual(body.attachments, ['data:image/png;base64,aGVsbG8=']);
+  assert.strictEqual(body.prompt, 'what is this?');
+});
+
+test('a text-only backend gets no image field at all', () => {
+  const body = client().body({
+    modelAlias: 'm',
+    turns: [{ speaker: 'human', utterance: 'what is this?', images: [shot] }],
+  });
+
+  assert.ok(!('attachments' in body));
+  assert.ok(!Object.values(body).some((v) => String(v).includes('aGVsbG8=')));
+});
+
+test('a text-only backend tells the model the image was not sent', () => {
+  const body = client().body({
+    modelAlias: 'm',
+    turns: [{ speaker: 'human', utterance: 'what is this?', images: [shot] }],
+  });
+
+  assert.match(body.prompt, /^what is this\?/);
+  assert.match(body.prompt, /attached image: image\/png/);
+  assert.match(body.prompt, /NOT sent/);
+  assert.match(body.prompt, /do not guess/i);
+});
+
+test('an image with no caption still produces a turn', () => {
+  const body = client().body({
+    modelAlias: 'm',
+    turns: [{ speaker: 'human', utterance: '', images: [shot] }],
+  });
+
+  assert.match(body.prompt, /attached image/);
+});
+
+test('images survive being one turn among many', () => {
+  const body = client({ imageField: 'images' }).body({
+    modelAlias: 'm',
+    turns: [
+      { speaker: 'human', utterance: 'hi' },
+      { speaker: 'assistant', utterance: 'hello' },
+      { speaker: 'human', utterance: 'and this?', images: [shot] },
+    ],
+  });
+
+  assert.deepStrictEqual(body.images, ['data:image/png;base64,aGVsbG8=']);
+  assert.match(body.prompt, /User: hi\n\nAssistant: hello\n\nUser: and this\?/);
+});
+
+test('a logged body summarises a data URL instead of printing it', () => {
+  const shown = describeRequest({
+    url: 'https://llm.example.com/api/chat',
+    body: { images: [`data:image/png;base64,${'A'.repeat(5000)}`], model: 'm' },
+    headers: {},
+    promptField: 'prompt',
+  });
+
+  assert.ok(!shown.includes('AAAA'));
+  assert.match(shown, /<image\/png, \d+ chars, hidden>/);
+  assert.match(shown, /"model": "m"/);
+});

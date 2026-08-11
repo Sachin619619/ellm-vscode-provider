@@ -30,6 +30,21 @@ function resultPieceToText(piece) {
 function partToPieces(part) {
   if (typeof part === 'string') return { text: part };
   if (part == null) return {};
+  // A LanguageModelDataPart carries bytes and a mime type, and no `value` - so it
+  // matched none of the branches below and fell through to {} - which is exactly
+  // how an attached screenshot used to vanish between the chat box and the prompt.
+  // Not every data part is an image: the same class carries text attachments, and
+  // VS Code also uses it for internal markers that have no place in a prompt.
+  if (part.mimeType && part.data) {
+    const mimeType = String(part.mimeType);
+    if (mimeType.startsWith('image/')) {
+      return { image: { mimeType, data: Buffer.from(part.data).toString('base64') } };
+    }
+    if (/^text\/|^application\/(json|xml|yaml)/.test(mimeType)) {
+      return { text: Buffer.from(part.data).toString('utf8') };
+    }
+    return {};
+  }
   if (typeof part.value === 'string') return { text: part.value };
   if (part.name && 'input' in part) {
     return { toolCall: { callId: part.callId, name: part.name, input: part.input } };
@@ -78,6 +93,7 @@ class EllmChatProvider {
       textPath: readSetting(this.context, 'textPath', ''),
       servedModelPath: readSetting(this.context, 'servedModelPath', ''),
       maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
+      imageField: readSetting(this.context, 'imageField', ''),
       // Identity and tuning are private to this machine - see storage.js.
       identity: getPrivate(this.context, 'identity', {}),
       params: getPrivate(this.context, 'params', {}),
@@ -95,7 +111,13 @@ class EllmChatProvider {
     try {
       const info = await client.listModels();
       const cap = info.limits?.maxResponseChars ?? 5000;
-      this.log(`discovered ${info.models.length} model(s), upstream cap ${cap} chars`);
+      // Claiming vision the backend does not have is worse than admitting none:
+      // VS Code would hand over the attachment, the prompt would carry no picture,
+      // and the model would describe one it never saw. So the claim is tied to
+      // there being a body field to actually put the image in.
+      const takesImages = Boolean(client.imageField);
+      this.log(`discovered ${info.models.length} model(s), upstream cap ${cap} chars`
+        + `, images ${takesImages ? `sent as "${client.imageField}"` : 'not supported'}`);
 
       return info.models.map((m) => ({
         id: m.alias,
@@ -113,7 +135,7 @@ class EllmChatProvider {
         maxOutputTokens: 32000,
         tooltip: `Enterprise LLM via ${client.url}`,
         detail: `${cap}-char cap, auto-continued`,
-        capabilities: { toolCalling: true, imageInput: false },
+        capabilities: { toolCalling: true, imageInput: takesImages },
       }));
     } catch (err) {
       this.log(`model discovery failed: ${err.message}`);
@@ -331,10 +353,12 @@ class EllmChatProvider {
       let text = '';
       const toolCalls = [];
       const toolResults = [];
+      const images = [];
 
       for (const part of msg.content ?? []) {
         const piece = partToPieces(part);
         if (piece.text) text += piece.text;
+        if (piece.image) images.push(piece.image);
         if (piece.toolCall) toolCalls.push(piece.toolCall);
         if (piece.toolResult) toolResults.push(piece.toolResult);
       }
@@ -350,7 +374,10 @@ class EllmChatProvider {
           .join('\n');
         text = text ? `${text}\n${rendered}` : rendered;
       }
-      if (text) turns.push({ speaker, utterance: text });
+      // An image with no caption is a whole message on its own - "explain this"
+      // is often typed in an earlier turn - so text is no longer what decides
+      // whether the turn exists.
+      if (text || images.length) turns.push({ speaker, utterance: text, images });
     }
 
     return turns;
@@ -358,10 +385,15 @@ class EllmChatProvider {
 
   // --- 3. token counting -----------------------------------------------------
   async provideTokenCount(_model, text, _token) {
-    const str = typeof text === 'string'
-      ? text
-      : (text?.content ?? []).map((p) => partToPieces(p).text ?? '').join('');
-    return Math.ceil(str.length / 4);
+    if (typeof text === 'string') return Math.ceil(text.length / 4);
+
+    const pieces = (text?.content ?? []).map(partToPieces);
+    const str = pieces.map((p) => p.text ?? '').join('');
+    // An image costs context whether or not it costs prompt characters. Counting
+    // it as zero is what lets a conversation with a few screenshots in it sail
+    // past the limit while this says it is nowhere near.
+    const imageChars = pieces.reduce((n, p) => n + (p.image?.data.length ?? 0), 0);
+    return Math.ceil((str.length + imageChars) / 4);
   }
 }
 

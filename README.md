@@ -71,6 +71,22 @@ gateways there is nothing to write at all:
 | `ellm.models` | model names, comma separated | — |
 | `ellm.textPath` | dot-path to the text in a frame | *(auto-detect)* |
 | `ellm.contextChars` | prompt characters the backend accepts | `400000` |
+| `ellm.imageField` | body key holding attached images | *(text-only)* |
+
+### Attaching images
+
+Left blank, `ellm.imageField` means the backend takes text only, and VS Code says so up front —
+attach a screenshot and Copilot answers *"Vision is not supported by the current model"* rather
+than sending it. That refusal is the honest outcome, and it is deliberately not papered over: a
+chat endpoint that takes one prompt string has nowhere to put a picture, and a model given the
+caption without the image does not report a missing attachment — it describes one that was never
+there. If an image does reach a text-only turn, the prompt names it and tells the model it cannot
+see it.
+
+Set `ellm.imageField` to the body key your backend reads — `images`, `attachments` — and images
+ride along as an array of `data:` URLs, with `imageInput` advertised to VS Code so the attach
+button lights up. Turn it on only once you know that key exists; the value is what the extension
+trusts when it decides whether it can see.
 
 `ellm.modelField` is the one worth reading twice. A backend that doesn't recognise the key it
 arrives under doesn't complain — it answers from its default, and the reply looks exactly like a
