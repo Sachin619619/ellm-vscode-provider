@@ -311,7 +311,7 @@ test('no budget means no budget rules, and the rest of the protocol is unchanged
   const prompt = buildToolPrompt([{ name: 'x' }]);
   assert.doesNotMatch(prompt, /Keep each reply under/);
   assert.match(prompt, /one tool call at a time/);
-  assert.match(prompt, /just answer normally/);
+  assert.match(prompt, /just answer in plain text/);
 });
 
 /**
@@ -447,10 +447,34 @@ test('a truncated call is reported, but truncated prose is still delivered', () 
 test('the protocol tells the model to finish the task instead of checking in', () => {
   const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
   assert.match(prompt, /automated agent loop/i);
-  assert.match(prompt, /Do not ask for permission/i);
+  assert.match(prompt, /not ask permission/i);
   assert.match(prompt, /TOOL RESULT/);
-  assert.match(prompt, /not with a question/i);
+  assert.match(prompt, /never end a turn with a question/i);
   assert.match(prompt, /must be a JSON object, not a string/i);
+});
+
+/**
+ * The block above is prepended, and this backend truncates from the front, so every
+ * character it costs is a character of headroom the user's request loses. The first
+ * version ran to nine bullets and grew the protocol by 1202 chars - shipped in
+ * v0.6.0, and the most likely reason a real agent started answering every prompt
+ * with the same sentence. Size is a property worth asserting, not just wording.
+ */
+test('the working-the-task block does not grow the protocol back', () => {
+  const tools = Array.from({ length: 20 }, (_, i) => ({
+    name: `tool_${i}`,
+    description: `Do the tool_${i} operation in the workspace, returning results.`,
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'what to look for' } },
+      required: ['query'],
+    },
+  }));
+  const prompt = buildToolPrompt(tools, { budgetChars: 4500 });
+  const guidance = prompt.slice(prompt.indexOf('Working the task:'));
+
+  assert.ok(guidance.length < 700,
+    `the guidance block is ${guidance.length} chars; it is prepended, so keep it small`);
 });
 
 test('an untagged call cut off mid-write keeps the continuation going', () => {
@@ -525,7 +549,6 @@ test('no chunking of a call leaks any of it into the chat', () => {
     ['json fence', `Now:\n\`\`\`json\n${BARE}\n\`\`\`\nDone.`, 1],
     ['bare fence', `Now:\n\`\`\`\n${BARE}\n\`\`\`\n`, 1],
     ['untagged, mid-reply', `I will read it.\n${BARE}\nNext.`, 1],
-    ['untagged, mid-sentence', `I think ${BARE} should do it.`, 1],
     ['prose around a tagged call', `Let me look.\n<tool_call>${BARE}</tool_call>\nThat is it.`, 1],
     ['two calls', `<tool_call>${BARE}</tool_call>\n<tool_call>${BODY}</tool_call>`, 2],
     ['braces inside the arguments', `<tool_call>${BODY}</tool_call>`, 1],
@@ -550,6 +573,11 @@ test('no chunking of a call leaks any of it into the chat', () => {
 test('no chunking turns prose into a tool call, or alters a character of it', () => {
   const cases = [
     'No tools needed. Here is a { and a < and a fence:\n```\nx = 1\n```\nend.',
+    // JSON with words either side of it is the model TALKING about a call. Treating
+    // it as one gutted the sentence and ran a tool nobody asked for.
+    `I think ${BARE} should do it.`,
+    `The package.json contains {"name": "read_file"} which is confusing but not a call.`,
+    `A tool call looks like ${BARE} in this protocol.`,
     'A tool call looks like {"name": "some_tool", "arguments": {}} in general.',
     'Your config:\n```json\n{"compilerOptions": {"strict": true}}\n```\nThat is all.',
     'The bug is on line 42 of app.js. Fix the off-by-one and you are done.',

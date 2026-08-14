@@ -91,6 +91,48 @@ const ARG_KEYS = ['arguments', 'parameters', 'args', 'input', 'parameter', 'argu
 /** An object that opens with one of those keys is a call, not prose. */
 const CALL_START = new RegExp(`\\{\\s*"(?:${NAME_KEYS.join('|')})"\\s*:`);
 
+/**
+ * ...but only when it stands on its own line.
+ *
+ * Recognising an untagged object anywhere in a reply is what stopped calls leaking
+ * as prose; it also means the model can no longer *talk* about a tool call without
+ * making one. "The package.json contains {"name": "read_file"} which is confusing"
+ * came out of the scanner as `The package.json contains  which is confusing` plus a
+ * phantom call - the sentence silently gutted and a tool run that nobody asked for.
+ *
+ * A call the model intends to make is written on a line of its own. JSON sitting
+ * inside a sentence, with words either side of it, is the model discussing JSON.
+ * That is the whole discriminator, and it costs nothing at stream time because the
+ * text before the brace has always already arrived.
+ */
+function atLineStart(text, index, whenExhausted = true) {
+  for (let i = index - 1; i >= 0; i--) {
+    const c = text[i];
+    if (c === '\n') return true;
+    if (c !== ' ' && c !== '\t' && c !== '\r') return false;
+  }
+  // Ran out of buffer without deciding, which in a stream does NOT mean the start of
+  // the reply: the words before the brace may have gone out in an earlier chunk,
+  // leaving the buffer beginning at the brace itself. Getting this wrong put the
+  // rule back to where it started - `I think {call}` was prose unchunked and a call
+  // when the boundary happened to fall before the brace. The scanner passes what it
+  // knows about the line it is on; a caller holding the whole text is really at the
+  // start.
+  return whenExhausted;
+}
+
+/** The first untagged call in `text` that stands on its own line, or null. */
+function findCallStart(text, from = 0, atStart = true) {
+  const re = new RegExp(CALL_START.source, 'g');
+  re.lastIndex = from;
+  let m = re.exec(text);
+  while (m) {
+    if (atLineStart(text, m.index, atStart)) return m;
+    m = re.exec(text);
+  }
+  return null;
+}
+
 /** The same, capturing the name, so a half-arrived object can still be judged. */
 const CALL_NAME = new RegExp(`\\{\\s*"(?:${NAME_KEYS.join('|')})"\\s*:\\s*"([^"\\\\\\n]{1,80})"`);
 
@@ -176,28 +218,27 @@ function buildToolPrompt(tools, { budgetChars = 0 } = {}) {
       '- Prefer editing the specific lines that change over rewriting a whole file.',
     ] : []),
     '',
-    // Without this block a chat-tuned model does one useful thing and then stops to
-    // check in - "I've read the file. Would you like me to fix it?" - which reads as
+    // Without this a chat-tuned model does one useful thing and then stops to check
+    // in - "I've read the file. Would you like me to fix it?" - which reads as
     // politeness and is in fact the end of the turn: a reply carrying no tool call
     // ends the agent loop, so the task is abandoned and the user has to say "yes,
-    // continue" to buy a single further step. The model is not refusing to work, it
-    // has simply never been told that finishing is its job.
+    // continue" to buy a single further step.
+    //
+    // Kept to four lines on purpose. The first version of this block ran to nine and
+    // added 1202 chars to a prompt that is PREPENDED, on a backend that truncates
+    // from the front - so it pushed the user's request towards the edge on every
+    // turn, and the request is the one thing that must never fall off. Anything that
+    // is merely nice to say belongs in the tool schemas, which are already there.
     'Working the task:',
-    '- You are running inside an automated agent loop, not a chat. Keep going until the '
-    + 'task is genuinely finished.',
-    '- Do not ask for permission, confirmation, or approval before an ordinary step '
-    + '(reading, searching, editing, creating a file, running a build). Take it.',
-    '- Do not ask the user a question that a tool could answer. Look it up instead.',
-    '- Do not stop to report progress or to describe a plan you intend to carry out. '
-    + 'Carry it out, then report once at the end.',
-    '- A message beginning "TOOL RESULT" is the output of your own call coming back, '
-    + 'not the user speaking. Read it and continue immediately with the next step.',
-    '- If a step fails, diagnose and try another way rather than handing the problem '
-    + 'back. Only stop early if you are truly blocked, and then say exactly what is '
-    + 'blocking you.',
-    '- Finish your turn only when the task is complete, and end with a short summary '
-    + 'of what you changed - not with a question.',
-    '- If no tool is needed, just answer normally in plain text.',
+    '- You are in an automated agent loop, not a chat. Keep going until the task is '
+    + 'finished. Do not ask permission for an ordinary step - reading, searching, '
+    + 'editing, running a build - just take it.',
+    '- Do not stop to report progress or describe a plan. Carry it out, then report '
+    + 'once at the end, and never end a turn with a question.',
+    '- A message beginning "TOOL RESULT" is your own call coming back, not the user. '
+    + 'Read it and continue with the next step.',
+    '- If a step fails, try another way rather than handing the problem back. If no '
+    + 'tool is needed, just answer in plain text.',
   ].join('\n');
 }
 
@@ -281,13 +322,11 @@ function normaliseToolName(name) {
 function hasUnfinishedCall(text, toolNames) {
   if (hasOpenToolCall(text)) return true;
 
-  const re = new RegExp(CALL_START.source, 'g');
+  // Same own-line rule as the scanner: an object quoted inside a sentence is the
+  // model talking about a call, and asking it to "continue" one it never started
+  // costs a round trip on every answer that happens to mention JSON.
   let start = -1;
-  let m = re.exec(text);
-  while (m) {
-    start = m.index;
-    m = re.exec(text);
-  }
+  for (let m = findCallStart(text); m; m = findCallStart(text, m.index + 1)) start = m.index;
   if (start === -1 || objectEnd(text, start) !== -1) return false;
 
   const named = CALL_NAME.exec(text.slice(start, start + 256));
@@ -393,6 +432,24 @@ class ToolCallScanner {
   /** ...and now it has, so that fence's closing half is still to come. */
   #fenceOpen = false;
   #seq = 0;
+  /**
+   * Whether the next character to leave the buffer would begin a line.
+   *
+   * The own-line rule that separates a real untagged call from prose about one can
+   * only be applied against the whole reply, and the buffer is a window onto it -
+   * so what has already been emitted has to be remembered here.
+   */
+  #lineStart = true;
+  /**
+   * A call start already accepted, whose object is still arriving.
+   *
+   * Once the own-line rule has said yes, the answer has to survive the next chunk.
+   * Re-deriving it fails on the fenced case: stripping the wrapping ```json takes
+   * the newline that put the call on its own line with it, so the continuation
+   * chunk sees a bare `{` with no line in front of it and lets the call through as
+   * prose.
+   */
+  #callPending = false;
   #onProblem;
   #known;
 
@@ -412,6 +469,15 @@ class ToolCallScanner {
   constructor(onProblem, toolNames) {
     this.#onProblem = onProblem || (() => {});
     this.#known = new Map((toolNames ?? []).map((n) => [normaliseToolName(n), n]));
+  }
+
+  /** Remember whether emitted text left us mid-line, for the own-line rule. */
+  #noteEmitted(text) {
+    if (!text) return;
+    const nl = text.lastIndexOf('\n');
+    if (nl !== -1) this.#lineStart = true;
+    const tail = nl === -1 ? text : text.slice(nl + 1);
+    if (/[^ \t\r]/.test(tail)) this.#lineStart = false;
   }
 
   /** The offered tool `name` refers to, or null when it refers to none. */
@@ -483,6 +549,9 @@ class ToolCallScanner {
     this.#buf += chunk;
     let text = '';
     const calls = [];
+    // Every emission goes through here so the own-line rule keeps its place in the
+    // reply across chunk boundaries.
+    const emit = (s) => { if (s) { text += s; this.#noteEmitted(s); } };
 
     for (;;) {
       if (this.#inCall) {
@@ -499,7 +568,7 @@ class ToolCallScanner {
           // Malformed call - tell the model it never ran so it can self-correct,
           // and put the reason in the log, where it is actually readable.
           this.#reportUnparsed(raw, true);
-          text += unparsedNotice(raw, true);
+          emit(unparsedNotice(raw, true));
         }
         continue;
       }
@@ -523,7 +592,7 @@ class ToolCallScanner {
       if (open) {
         // A fence the model opened purely to wrap the call is not prose, and
         // emitting it leaves a stray ``` sitting above the tool call in the chat.
-        text += this.#takeFenceBefore(this.#buf.slice(0, open.index));
+        emit(this.#takeFenceBefore(this.#buf.slice(0, open.index)));
         this.#buf = this.#buf.slice(open.index + open[0].length);
         this.#inCall = true;
         continue;
@@ -534,14 +603,14 @@ class ToolCallScanner {
       // happens to be in the reply - not only at the very start.
       const untagged = this.#takeUntagged();
       if (untagged) {
-        text += untagged.text;
+        emit(untagged.text);
         calls.push(...untagged.calls);
         if (untagged.wait) break;
         continue;
       }
 
       const hold = holdTail(this.#buf);
-      text += this.#buf.slice(0, this.#buf.length - hold);
+      emit(this.#buf.slice(0, this.#buf.length - hold));
       this.#buf = hold ? this.#buf.slice(this.#buf.length - hold) : '';
       break;
     }
@@ -557,7 +626,7 @@ class ToolCallScanner {
    * chat as prose is exactly the leak this class exists to prevent.
    */
   #takeUntagged() {
-    const m = CALL_START.exec(this.#buf);
+    const m = findCallStart(this.#buf, 0, this.#lineStart || this.#callPending);
     if (!m) return null;
 
     const end = objectEnd(this.#buf, m.index);
@@ -569,7 +638,10 @@ class ToolCallScanner {
       // stream ends. Before the name closes its quote there is nothing to judge, so
       // it keeps being held: releasing it there is the partial-object leak.
       const rest = this.#buf.slice(m.index);
-      if (CALL_NAME.test(rest.slice(0, 256)) && !this.#looksLikeCall(rest)) return null;
+      if (CALL_NAME.test(rest.slice(0, 256)) && !this.#looksLikeCall(rest)) {
+        this.#callPending = false;
+        return null;
+      }
       // Through #takeFenceBefore, not stripFenceBefore: the wrapping fence is being
       // swallowed here, so its closing half has to be remembered here too. Doing it
       // only on the path where the whole call arrives at once means a call split
@@ -578,16 +650,21 @@ class ToolCallScanner {
       // code block. 2725 of 3160 possible splits of one fenced call leaked it.
       const before = this.#takeFenceBefore(this.#buf.slice(0, m.index));
       this.#buf = this.#buf.slice(m.index);
+      this.#callPending = true;
       return { text: before, calls: [], wait: true };
     }
 
     const found = this.#toCalls(this.#buf.slice(m.index, end));
     // Not a call after all (an unknown name, or example JSON in an answer about
     // JSON) - leave it in the buffer as the prose it is.
-    if (!found.length) return null;
+    if (!found.length) {
+      this.#callPending = false;
+      return null;
+    }
 
     const text = this.#takeFenceBefore(this.#buf.slice(0, m.index));
     this.#buf = this.#buf.slice(end);
+    this.#callPending = false;
     this.#callDone();
     return { text, calls: found };
   }
@@ -601,6 +678,8 @@ class ToolCallScanner {
     const inCall = this.#inCall;
     this.#buf = '';
     this.#inCall = false;
+    this.#lineStart = true;
+    this.#callPending = false;
     if (!buf) return { text: '', calls: [] };
     // The other half of a fence whose contents became a tool call. On its own it is
     // an empty code block in the chat, which looks like output that went missing.

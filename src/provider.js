@@ -186,6 +186,22 @@ class EllmChatProvider {
       this.log(`${tools.length} tool(s) offered, reply budget ${budget} chars (cap ${cap})`);
     }
 
+    // Speakers and sizes of what is about to be sent - never content.
+    //
+    // This existed in v0.4.4, was lost in the v0.5.0 revert, and its absence is why
+    // the next problem took guesswork instead of a glance. When a backend truncates
+    // from the front, the failure looks like a model ignoring the request; the only
+    // way to see it is the total, and which turn is carrying the weight. The
+    // configured budget is printed beside it so "too big" is a comparison, not a
+    // hunch.
+    const total = turns.reduce((n, t) => n + (t.utterance?.length ?? 0), 0);
+    const budgetChars = readSetting(this.context, 'contextChars');
+    this.log(`turns: ${turns.map((t) => `${t.speaker}(${t.utterance?.length ?? 0})`).join(' ')}`
+      + ` = ${total} chars of ${budgetChars} budget`
+      + (total > budgetChars
+        ? ' -- OVER BUDGET: the backend will truncate, and it truncates from the FRONT'
+        : ''));
+
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());
 
