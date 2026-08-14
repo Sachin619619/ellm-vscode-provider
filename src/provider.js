@@ -1,8 +1,12 @@
 const vscode = require('vscode');
-const { CorpClient, CorpAuthError, describeConflict, describeRequest } = require('./corpClient');
+const {
+  CorpClient, CorpAuthError, describeConflict, describeRequest,
+  CHARS_PER_TOKEN, DEFAULT_CONTEXT_CHARS,
+} = require('./corpClient');
 const { withContinuation } = require('./continuation');
 const {
-  buildToolPrompt, budgetFor, ToolCallScanner, hasOpenToolCall, restartsToolCall, dropOpenToolCall,
+  buildToolPrompt, budgetFor, ToolCallScanner, hasUnfinishedCall, restartsToolCall,
+  dropOpenToolCall,
 } = require('./toolshim');
 const { getToken, getCookie, getPrivate, readSetting } = require('./storage');
 
@@ -80,20 +84,25 @@ class EllmChatProvider {
 
   async client() {
     return new CorpClient({
-      url: readSetting(this.context, 'url', ''),
+      url: readSetting(this.context, 'url'),
       token: await getToken(this.context),
       cookie: await getCookie(this.context),
-      authHeader: readSetting(this.context, 'authHeader', 'X-Corp-Auth'),
-      authPrefix: readSetting(this.context, 'authPrefix', ''),
-      chatPath: readSetting(this.context, 'chatPath', '/chat'),
-      promptField: readSetting(this.context, 'promptField', 'prompt'),
-      modelField: readSetting(this.context, 'modelField', 'model'),
-      models: String(readSetting(this.context, 'models', ''))
+      authHeader: readSetting(this.context, 'authHeader'),
+      authPrefix: readSetting(this.context, 'authPrefix'),
+      chatPath: readSetting(this.context, 'chatPath'),
+      promptField: readSetting(this.context, 'promptField'),
+      modelField: readSetting(this.context, 'modelField'),
+      models: String(readSetting(this.context, 'models'))
         .split(',').map((s) => s.trim()).filter(Boolean),
-      textPath: readSetting(this.context, 'textPath', ''),
-      servedModelPath: readSetting(this.context, 'servedModelPath', ''),
-      maxResponseChars: readSetting(this.context, 'maxResponseChars', 5000),
-      imageField: readSetting(this.context, 'imageField', ''),
+      textPath: readSetting(this.context, 'textPath'),
+      servedModelPath: readSetting(this.context, 'servedModelPath'),
+      maxResponseChars: readSetting(this.context, 'maxResponseChars'),
+      // Was accepted by the constructor and never passed, so the 400000 default
+      // was an unchangeable constant wearing the clothes of a setting. A knob that
+      // is only half wired is worse than an honest literal: the code reads as
+      // though the case is covered.
+      contextChars: readSetting(this.context, 'contextChars'),
+      imageField: readSetting(this.context, 'imageField'),
       // Identity and tuning are private to this machine - see storage.js.
       identity: getPrivate(this.context, 'identity', {}),
       params: getPrivate(this.context, 'params', {}),
@@ -129,7 +138,7 @@ class EllmChatProvider {
         // id where the model name belongs.
         family: m.alias,
         version: '1.0.0',
-        maxInputTokens: Math.floor((m.contextChars ?? 400000) / 4),
+        maxInputTokens: Math.floor((m.contextChars ?? DEFAULT_CONTEXT_CHARS) / CHARS_PER_TOKEN),
         // Deliberately far above the upstream's per-response cap: the continuation
         // layer stitches capped rounds into one answer.
         maxOutputTokens: 32000,
@@ -159,7 +168,7 @@ class EllmChatProvider {
     // Read once and used twice: the budget the model is told about and the cap the
     // continuation layer recovers from must come from the same number, or the model is
     // aiming at a limit that is not the one being enforced.
-    const cap = readSetting(this.context, 'maxResponseChars', 5000);
+    const cap = readSetting(this.context, 'maxResponseChars');
     const budget = budgetFor(cap);
 
     const turns = this.toTurns(messages, shimming);
@@ -174,8 +183,15 @@ class EllmChatProvider {
     const controller = new AbortController();
     const sub = token.onCancellationRequested(() => controller.abort());
 
+    // The names are what let the scanner recognise a call the model wrote without
+    // the tags. `{"name": ...}` alone is ambiguous - a call in an agent turn, an
+    // example in an answer about JSON - and matching against the tools actually on
+    // offer is the only thing that tells the two apart.
     const scanner = shimming
-      ? new ToolCallScanner((msg) => this.log(`TOOL CALL PROBLEM: ${msg}`))
+      ? new ToolCallScanner(
+        (msg) => this.log(`TOOL CALL PROBLEM: ${msg}`),
+        tools.map((t) => t.name),
+      )
       : null;
     const started = Date.now();
     let chars = 0;
@@ -202,11 +218,15 @@ class EllmChatProvider {
 
       const stream = withContinuation(rounds, turns, {
         maxResponseChars: cap,
-        maxContinuations: readSetting(this.context, 'maxContinuations', 20),
+        maxContinuations: readSetting(this.context, 'maxContinuations'),
         // A file written through a 5000-char cap arrives over many rounds, and a
         // backend that reports a clean stop for a capped response would otherwise
-        // end the answer mid-JSON. An unclosed tool call settles it.
-        needsMore: shimming ? hasOpenToolCall : undefined,
+        // end the answer mid-JSON. An unclosed tool call settles it - including one
+        // the model wrote without the tags, which is most of them by the time a
+        // reply is long enough to be cut in half.
+        needsMore: shimming
+          ? (text) => hasUnfinishedCall(text, tools.map((t) => t.name))
+          : undefined,
         // ...and if the model answers "continue" by writing the call again from
         // the top, keep the new one. Splicing it onto the abandoned half is how a
         // file gets written with its middle duplicated.
@@ -222,12 +242,25 @@ class EllmChatProvider {
           progress.report(new vscode.LanguageModelTextPart(text));
         }
         for (const c of found) {
+          // A throw here escapes provideLanguageModelChatResponse and fails the
+          // whole reply - so one badly shaped argument object would discard the
+          // prose already streamed and end the agent loop, rather than costing
+          // the single call it belongs to.
+          let input;
+          try {
+            input = JSON.parse(c.function.arguments || '{}');
+          } catch (err) {
+            this.log(`TOOL CALL PROBLEM: arguments for "${c.function.name}" are not `
+              + `JSON (${err.message}); calling it with no arguments`);
+            input = {};
+          }
+          if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+            this.log(`TOOL CALL PROBLEM: arguments for "${c.function.name}" came back as `
+              + `${Array.isArray(input) ? 'an array' : typeof input}, not an object`);
+            input = {};
+          }
           calls++;
-          progress.report(new vscode.LanguageModelToolCallPart(
-            c.id,
-            c.function.name,
-            JSON.parse(c.function.arguments || '{}'),
-          ));
+          progress.report(new vscode.LanguageModelToolCallPart(c.id, c.function.name, input));
         }
       };
 
@@ -310,10 +343,10 @@ class EllmChatProvider {
     // Opt-in, because the body carries the identity block and this channel gets
     // pasted into chat windows. Off by default; turned on to compare against the
     // web app's payload, then turned off again.
-    const mode = readSetting(this.context, 'logRequestBody', 'off');
+    const mode = readSetting(this.context, 'logRequestBody');
     if (mode === 'keys' || mode === 'full') {
       this.log(`request payload (${mode}):\n${describeRequest(
-        { url, body, headers, promptField: readSetting(this.context, 'promptField', 'prompt') },
+        { url, body, headers, promptField: readSetting(this.context, 'promptField') },
         { values: mode === 'full' },
       )}`);
     }
@@ -365,8 +398,19 @@ class EllmChatProvider {
 
       // A plain chat endpoint has no notion of tool turns, so render them as text
       // in exactly the format the shim taught the model to produce and read.
+      //
+      // There is no speaker for "the tool" - the backend knows human, assistant and
+      // system - so a result arrives labelled as the user talking. A chat-tuned model
+      // reads that as a fresh message from a person and answers it conversationally
+      // ("I've read the file, shall I go on?"), which ends the turn and with it the
+      // agent loop. Saying whose output this is costs one line and removes the
+      // misreading; the tool prompt makes the same point from the other side.
       for (const r of toolResults) {
-        turns.push({ speaker: 'human', utterance: `TOOL RESULT (${r.callId}):\n${r.content}` });
+        turns.push({
+          speaker: 'human',
+          utterance: `TOOL RESULT (${r.callId}) - output of your own tool call, `
+            + `not a message from the user:\n${r.content}`,
+        });
       }
       if (toolCalls.length && shimming) {
         const rendered = toolCalls
@@ -380,12 +424,33 @@ class EllmChatProvider {
       if (text || images.length) turns.push({ speaker, utterance: text, images });
     }
 
+    // Every agent round after the first ends on a tool result, and that is exactly
+    // the moment the model decides whether to carry on or to hand back. Left to
+    // itself it hands back, because the last thing in the prompt looks like someone
+    // telling it something rather than a job half done.
+    //
+    // Kept to one short line, and deliberately silent about which earlier message
+    // holds the request: every previous attempt to point at it ("the message above",
+    // "the message that follows") was wrong for half of all requests, because the
+    // request is not at a fixed distance from the end.
+    const last = turns[turns.length - 1];
+    if (shimming && last?.speaker === 'human' && last.utterance?.startsWith('TOOL RESULT')) {
+      turns.push({
+        speaker: 'human',
+        utterance: 'Continue the task with the next step. Call the next tool if one is '
+          + 'needed. Do not ask whether to continue.',
+      });
+    }
+
     return turns;
   }
 
   // --- 3. token counting -----------------------------------------------------
   async provideTokenCount(_model, text, _token) {
-    if (typeof text === 'string') return Math.ceil(text.length / 4);
+    // Same CHARS_PER_TOKEN as maxInputTokens above, and that is the whole point:
+    // VS Code fills the context window by counting with this and comparing against
+    // that, so two different divisors mean it packs to a budget nobody configured.
+    if (typeof text === 'string') return Math.ceil(text.length / CHARS_PER_TOKEN);
 
     const pieces = (text?.content ?? []).map(partToPieces);
     const str = pieces.map((p) => p.text ?? '').join('');
@@ -393,7 +458,7 @@ class EllmChatProvider {
     // it as zero is what lets a conversation with a few screenshots in it sail
     // past the limit while this says it is nowhere near.
     const imageChars = pieces.reduce((n, p) => n + (p.image?.data.length ?? 0), 0);
-    return Math.ceil((str.length + imageChars) / 4);
+    return Math.ceil((str.length + imageChars) / CHARS_PER_TOKEN);
   }
 }
 

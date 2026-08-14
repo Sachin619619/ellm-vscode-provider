@@ -171,7 +171,26 @@ call actually arrives:
 - a tag **split across streaming chunks** is reassembled, never half-emitted
 - a **mangled closing tag** (`</tool_call}`, or none at all) is still parsed as a call rather
   than dumped on the user as raw markup
-- a **bare, untagged** `{"name": …, "arguments": …}` answer is recognised as the call it is
+- the **tags are matched as a shape, not a string**: `<tool-call>`, `<TOOL_CALL>`, `<tool_call >`,
+  `<tool_use>` and `<function_call>` all count. Measured against thirteen replies a chat-tuned
+  model really produces, matching the literal `<tool_call>` caught six; the other seven were
+  printed into the chat as raw markup and never ran
+- a call **wrapped in a ```json fence** — which is how a model that has spent its life in a chat
+  window writes JSON, whatever it was told — is unwrapped, and the fence does not survive into
+  the chat as an empty code block
+- a **bare, untagged** `{"name": …, "arguments": …}` is recognised **anywhere in the reply**, not
+  only when it is the first thing in it. A model that writes "I'll read that file now." before
+  the call used to leak the whole call as prose
+- the shapes a model reaches for **instead of** the one it was given are normalised: `tool_name`
+  or `recipient_name` for the name, `parameters`/`args`/`input` for the arguments, a
+  `functions.` prefix on the name, the whole OpenAI `{"function": {…}}` envelope, and a list
+  when it means one call
+- **`"arguments"` given as a JSON *string*** rather than an object is parsed through. This one is
+  worse than a leak: it parses cleanly, so nothing looks wrong, and the tool is then handed a
+  string where its schema says object and reads every field as `undefined`
+- an **untagged call cut off mid-write** keeps the continuation layer going, the same as a tagged
+  one. Only the name is checked against the tools the client actually offered, so prose that
+  merely contains a brace does not buy extra round trips
 - a **file body written with unescaped quotes** — a Python `"""docstring"""`, a Windows path —
   is repaired rather than thrown away (see [`src/jsonRepair.js`](src/jsonRepair.js))
 - a call the model **restarted** instead of continuing replaces the half it walked away from,
@@ -278,7 +297,11 @@ That is everything `corpClient.js` needs, and it is short enough to read line by
 you decide it is shareable. Pass `--hosts` to keep hostnames.
 
 Set `ellm.maxResponseChars` to your backend's cap (0 disables continuation) and
-`ellm.maxContinuations` to bound how many rounds a single answer may take.
+`ellm.maxContinuations` to bound how many rounds a single answer may take. Every default
+comes from the `contributes.configuration` block in `package.json` and nowhere else — the
+panel and the provider both read it rather than restating it, because the version that
+restated it disagreed with itself, and pressing **Save** then quietly cut `maxContinuations`
+from 20 to 8 and with it the longest answer that could still be recovered.
 
 ## Try it without a real backend
 
@@ -326,16 +349,20 @@ few settings decide whether agent mode feels usable:
   the backend truncates — from the *start* of the prompt, which is where the conversation and
   the system instructions live. Nothing in the reply reveals this happened. If long sessions
   start ignoring tools or forgetting earlier turns, lower it first.
-- **Independent calls are batched.** The model is asked to emit several
-  `<tool_call>` blocks in one reply when they don't depend on each other, and to send a call
-  alone when it carries a file or when the next step needs its result. Serialising every call
-  costs a full round trip each, through the response cap and the continuation stitcher.
-- **Tool instructions are appended, not prepended.** They sit after the whole conversation, so
-  they're the last thing read before the model writes — and they re-anchor after every tool
-  result.
-- **A busy gateway is retried.** 408, 425, 429 and 5xx get two retries with backoff, honouring
-  `Retry-After`. Only the opening request is replayed; once frames have streamed, a failure is
-  final, because retrying would duplicate what the chat already showed.
+- **One call at a time.** The model is asked to send a single `<tool_call>` and stop. Batching
+  independent calls was tried and reverted with v0.5.0: through a 5000-char cap, a reply
+  carrying two calls is a reply twice as likely to be guillotined mid-JSON.
+- **Tool instructions are prepended.** The schemas sit at the front of the prompt, ahead of the
+  conversation. Putting them at the back was tried twice and broke the plugin outright both
+  times — with a real VS Code tool list the block is ~12,000 characters, so appending it pushes
+  the user's actual request to the front, which is the end this backend truncates from.
+- **The model is told to keep working.** A chat-tuned model does one useful thing and then asks
+  "shall I continue?", and a reply with no tool call in it *ends the agent loop* — so the
+  politeness costs you the task. The protocol tells it, in as many words, not to ask permission
+  for ordinary steps, not to stop to report progress, and not to end a turn with a question.
+- **`chat.agent.maxRequests` is VS Code's own limit, not this plugin's.** After that many tool
+  calls in one turn VS Code itself stops and asks whether to keep going. The default is 25;
+  raise it if you are being asked to continue part-way through real work.
 - **Check `params`.** The model parameters block is usually pasted from a DevTools capture of
   the web chat UI, so it can carry that UI's sampling settings. Agent work wants a low
   temperature; a chat default of `0.7` shows up as a model that improvises around instructions.

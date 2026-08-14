@@ -2,7 +2,7 @@ const vscode = require('vscode');
 const { CorpClient, describeConflict, describeRequest } = require('./corpClient');
 const {
   getToken, setToken, clearToken, tokenLocation, getCookie, setCookie,
-  getPrivate, setPrivate, readSetting, saveSettings, COOKIE_KEY, clearSecret,
+  getPrivate, setPrivate, readSetting, saveSettings, COOKIE_KEY, clearSecret, defaultFor,
 } = require('./storage');
 
 /**
@@ -25,22 +25,23 @@ function openConfigPanel(context, provider) {
   const pushState = async () => {
     panel.webview.postMessage({
       type: 'state',
-      url: readSetting(context, 'url', ''),
-      chatPath: readSetting(context, 'chatPath', '/chat'),
-      promptField: readSetting(context, 'promptField', 'prompt'),
-      modelField: readSetting(context, 'modelField', 'model'),
+      url: readSetting(context, 'url'),
+      chatPath: readSetting(context, 'chatPath'),
+      promptField: readSetting(context, 'promptField'),
+      modelField: readSetting(context, 'modelField'),
       tokenLocation: await tokenLocation(context),
       hasCookie: Boolean(await getCookie(context)),
-      authHeader: readSetting(context, 'authHeader', 'X-Corp-Auth'),
-      authPrefix: readSetting(context, 'authPrefix', ''),
-      models: readSetting(context, 'models', ''),
-      textPath: readSetting(context, 'textPath', ''),
-      servedModelPath: readSetting(context, 'servedModelPath', ''),
-      logRequestBody: readSetting(context, 'logRequestBody', 'off'),
+      authHeader: readSetting(context, 'authHeader'),
+      authPrefix: readSetting(context, 'authPrefix'),
+      models: readSetting(context, 'models'),
+      textPath: readSetting(context, 'textPath'),
+      servedModelPath: readSetting(context, 'servedModelPath'),
+      logRequestBody: readSetting(context, 'logRequestBody'),
       identity: JSON.stringify(getPrivate(context, 'identity', {}), null, 2),
       params: JSON.stringify(getPrivate(context, 'params', {}), null, 2),
-      maxResponseChars: readSetting(context, 'maxResponseChars', 5000),
-      maxContinuations: readSetting(context, 'maxContinuations', 8),
+      maxResponseChars: readSetting(context, 'maxResponseChars'),
+      maxContinuations: readSetting(context, 'maxContinuations'),
+      contextChars: readSetting(context, 'contextChars'),
     });
   };
 
@@ -73,16 +74,21 @@ function openConfigPanel(context, provider) {
         await setPrivate(context, 'identity', identity);
         await setPrivate(context, 'params', params);
 
-        const authHeader = String(msg.authHeader || '').trim() || 'X-Corp-Auth';
+        // Blank means "use the default", and the default is the manifest's - never a
+        // literal repeated here. A panel that restates a default is a panel that can
+        // quietly overwrite a working value with a stale one the moment Save is pressed.
+        const field = (value, key) => String(value || '').trim() || defaultFor(key);
+
+        const authHeader = field(msg.authHeader, 'authHeader');
         const authPrefix = String(msg.authPrefix ?? '');
-        const chatPath = String(msg.chatPath || '').trim() || '/chat';
+        const chatPath = field(msg.chatPath, 'chatPath');
         const models = String(msg.models || '').trim();
-        const promptField = String(msg.promptField || '').trim() || 'prompt';
-        const modelField = String(msg.modelField || '').trim() || 'model';
+        const promptField = field(msg.promptField, 'promptField');
+        const modelField = field(msg.modelField, 'modelField');
         const textPath = String(msg.textPath || '').trim();
         const servedModelPath = String(msg.servedModelPath || '').trim();
         const logRequestBody = ['off', 'keys', 'full'].includes(msg.logRequestBody)
-          ? msg.logRequestBody : 'off';
+          ? msg.logRequestBody : defaultFor('logRequestBody');
 
         warnings.push(await saveSettings(context, {
           url,
@@ -95,8 +101,9 @@ function openConfigPanel(context, provider) {
           textPath,
           servedModelPath,
           logRequestBody,
-          maxResponseChars: Number(msg.maxResponseChars) || 5000,
-          maxContinuations: Number(msg.maxContinuations) || 8,
+          maxResponseChars: Number(msg.maxResponseChars) || defaultFor('maxResponseChars'),
+          maxContinuations: Number(msg.maxContinuations) || defaultFor('maxContinuations'),
+          contextChars: Number(msg.contextChars) || defaultFor('contextChars'),
         }));
 
         const token = await getToken(context);
@@ -356,6 +363,11 @@ function html(webview) {
     </div>
   </div>
 
+  <label>Prompt char budget
+    <span class="hint">how much prompt the backend accepts. Too high is silent:
+    it truncates from the front, where the tool definitions are.</span></label>
+  <input id="contextChars" type="number" min="0" />
+
   <div class="actions">
     <button id="save">Save &amp; Test</button>
     <button id="clear" class="secondary">Clear credentials</button>
@@ -384,6 +396,7 @@ function html(webview) {
       $('params').value = m.params === '{}' ? '' : m.params;
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
+      $('contextChars').value = m.contextChars;
       $('saved').textContent = m.tokenLocation
         ? 'Token saved in ' + m.tokenLocation + '. Leave blank to keep it.'
         : 'No token saved yet.';
@@ -419,6 +432,7 @@ function html(webview) {
       modelField: $('modelField').value,
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
+      contextChars: $('contextChars').value,
     });
     $('token').value = '';
     $('cookie').value = '';

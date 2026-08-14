@@ -43,6 +43,30 @@ const DEFAULT_PROMPT_FIELD = 'prompt';
 const DEFAULT_MODEL_FIELD = 'model';
 
 /**
+ * How much prompt the backend is assumed to accept, when nothing says otherwise.
+ *
+ * A guess, and the panel exists to correct it. Over-stating it is the dangerous
+ * direction and it fails silently: VS Code packs context up to whatever
+ * `maxInputTokens` claims, the backend takes what it wants and truncates the rest
+ * from the START, and the front of the prompt is where the tool definitions and
+ * the system instructions live. The model is left holding the tail of a
+ * conversation with no protocol and no request, which does not look like a size
+ * problem from the chat - it looks like the model ignoring its tools.
+ */
+const DEFAULT_CONTEXT_CHARS = 400000;
+
+/**
+ * Characters per token, for turning a char budget into the token counts VS Code
+ * speaks. One constant, used by both `provideTokenCount` and `maxInputTokens`,
+ * because those two have to agree: VS Code fills the window by counting with the
+ * first and comparing against the second, so if they disagree the budget it packs
+ * to is not the one that was configured. The exact value matters far less than
+ * their agreement - it cancels out - but 3.2 is nearer real code and prose than
+ * the usual 4, and erring low errs toward sending too little.
+ */
+const CHARS_PER_TOKEN = 3.2;
+
+/**
  * Where a streamed frame keeps its text. Backends disagree, so try the shapes that
  * exist in the wild, cheapest first. `ellm.textPath` overrides all of this when the
  * real frame is known - guessing is a fallback, not the design.
@@ -458,7 +482,7 @@ class CorpClient {
     // the prompt rather than sent, because a model that is handed a question about
     // a picture it never received answers it anyway - see toPrompt.
     this.imageField = imageField || '';
-    this.contextChars = contextChars || 400000;
+    this.contextChars = contextChars || DEFAULT_CONTEXT_CHARS;
     this.maxResponseChars = maxResponseChars || 5000;
   }
 
@@ -767,4 +791,5 @@ module.exports = {
   CorpClient, CorpAuthError, textFrom, finishFrom, modelFrom, sameModel,
   salvageText, stripPadding, isTransportEnvelope,
   modelFieldConflicts, describeConflict, normalizeModel, describeRequest,
+  CHARS_PER_TOKEN, DEFAULT_CONTEXT_CHARS,
 };

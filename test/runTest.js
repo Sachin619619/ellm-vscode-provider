@@ -37,9 +37,19 @@ async function main() {
         '--disable-gpu',
         '--user-data-dir', userDataDir,
       ],
+      // activate() seeds the connection from these when it is running under test.
+      // All of them have to be forwarded, not just the URL and token: the profile
+      // is a fresh --user-data-dir with nothing configured, and the model list in
+      // particular is not discoverable - the backend has no models endpoint the
+      // provider can ask, so an unset ELLM_TEST_MODELS leaves the picker empty and
+      // the suite stops at model discovery. That is what it did.
       extensionTestsEnv: {
         ELLM_TEST_URL: process.env.ELLM_TEST_URL,
         ELLM_TEST_TOKEN: process.env.ELLM_TEST_TOKEN,
+        ELLM_TEST_MODELS: process.env.ELLM_TEST_MODELS,
+        ELLM_TEST_CHAT_PATH: process.env.ELLM_TEST_CHAT_PATH,
+        ELLM_TEST_PROMPT_FIELD: process.env.ELLM_TEST_PROMPT_FIELD,
+        ELLM_TEST_AUTH_HEADER: process.env.ELLM_TEST_AUTH_HEADER,
         ELLM_TEST_WORKSPACE: workspace,
         ELLM_RESULT_FILE: process.env.ELLM_RESULT_FILE,
       },

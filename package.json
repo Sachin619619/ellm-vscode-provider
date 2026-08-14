@@ -66,6 +66,11 @@
           "default": 20,
           "description": "Safety limit on how many times one answer may be continued. A file written through the response cap needs one round per cap-full of text, so a large file needs many."
         },
+        "ellm.contextChars": {
+          "type": "number",
+          "default": 400000,
+          "description": "How many characters of prompt the backend accepts. VS Code fills the context window to this, so setting it too high is silent: the backend truncates the excess from the FRONT, where the tool definitions and system instructions are, and the model then looks like it is ignoring its tools. Lower it if replies stop matching the request."
+        },
         "ellm.tokenStorage": {
           "type": "string",
           "enum": [

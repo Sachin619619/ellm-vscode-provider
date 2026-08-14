@@ -43,6 +43,11 @@ async function run() {
     check('extension activated', Boolean(ext?.isActive));
 
     // --- model discovery through the real API ------------------------------
+    // activate() seeds the connection from ELLM_TEST_* when it is running under
+    // test, so the throwaway --user-data-dir profile arrives configured. Note the
+    // model list is part of that seed and not optional: there is no discovery
+    // endpoint, so an unset ELLM_TEST_MODELS means zero models and the run stops
+    // here having tested none of what it exists to test.
     let models = [];
     for (let i = 0; i < 20 && models.length === 0; i++) {
       models = await vscode.lm.selectChatModels({ vendor: 'corp-ellm' });
@@ -183,12 +188,17 @@ async function checkStorage(context) {
     check('getToken finds the token in either plain store',
       (await storage.getToken(context)) === `${probe}-ws`);
 
+    // No literal default here: the manifest's is the only one, and writing 8 in
+    // this assertion is how the panel came to disagree with the schema in the
+    // first place. Ask storage for it the same way the code does.
+    const schemaDefault = storage.defaultFor('maxContinuations');
     await context.globalState.update('fallback.maxContinuations', 3);
     check('an unwritable settings.json falls back to extension storage',
-      storage.readSetting(context, 'maxContinuations', 8) === 3);
+      storage.readSetting(context, 'maxContinuations') === 3);
     await context.globalState.update('fallback.maxContinuations', undefined);
     check('clearing the fallback hands the setting back to settings.json',
-      storage.readSetting(context, 'maxContinuations', 8) === 8);
+      storage.readSetting(context, 'maxContinuations') === schemaDefault,
+      `expected the manifest default ${schemaDefault}`);
 
     await storage.clearToken(context);
     check('clearing the token empties every store',

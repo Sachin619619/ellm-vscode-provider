@@ -313,3 +313,266 @@ test('no budget means no budget rules, and the rest of the protocol is unchanged
   assert.match(prompt, /one tool call at a time/);
   assert.match(prompt, /just answer normally/);
 });
+
+/**
+ * Shapes a chat-tuned model actually emits instead of the protocol it was taught.
+ *
+ * Measured before these were handled: 7 of 13 printed the call into the chat as raw
+ * markup and never ran it, and 3 more produced a call the tool could not accept. The
+ * user-visible symptom is the same for all ten - "it isn't using tools, and the tool
+ * calls leak into the chat" - so they are pinned together.
+ */
+const TOOLS = ['read_file', 'write_file', 'run_in_terminal'];
+
+/** As `scan`, but with the offered tool names the provider passes in real use. */
+function scanKnown(chunks, names = TOOLS) {
+  const scanner = new ToolCallScanner(null, names);
+  let text = '';
+  const calls = [];
+  for (const chunk of [].concat(chunks)) {
+    const out = scanner.push(chunk);
+    text += out.text;
+    calls.push(...out.calls);
+  }
+  const rest = scanner.flush();
+  text += rest.text;
+  calls.push(...rest.calls);
+  return { text, calls };
+}
+
+const BARE = '{"name":"read_file","arguments":{"path":"a.js"}}';
+
+/** Chunked the way a stream delivers it, so a shape cannot pass by arriving whole. */
+const inPieces = (s) => s.match(/[\s\S]{1,17}/g) ?? [];
+
+test('a call wrapped in a markdown fence leaves no fence in the chat', () => {
+  for (const raw of [
+    '```\n<tool_call>' + BARE + '</tool_call>\n```',
+    '```json\n' + BARE + '\n```',
+    'Let me check.\n\n```json\n' + BARE + '\n```\n',
+  ]) {
+    const { text, calls } = scanKnown(inPieces(raw));
+    assert.strictEqual(calls.length, 1, raw);
+    assert.doesNotMatch(text, /```/, raw);
+  }
+});
+
+test('the tags are matched as a shape, not as one exact string', () => {
+  for (const raw of [
+    `<tool_call >${BARE}</tool_call>`,
+    `<tool-call>${BARE}</tool-call>`,
+    `<TOOL_CALL>${BARE}</TOOL_CALL>`,
+    `<tool_use>${BARE}</tool_use>`,
+    `<function_call>${BARE}</function_call>`,
+  ]) {
+    const { text, calls } = scanKnown(inPieces(raw));
+    assert.strictEqual(calls.length, 1, raw);
+    assert.strictEqual(text, '', raw);
+  }
+});
+
+test('an untagged call is found after prose, not only at the very start', () => {
+  const { text, calls } = scanKnown(inPieces('I will read the file now.\n' + BARE));
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].function.name, 'read_file');
+  assert.doesNotMatch(text, /"name"/);
+});
+
+test('an untagged call between two pieces of prose keeps both', () => {
+  const { text, calls } = scanKnown(inPieces(`Sure.\n\n${BARE}\n\nThat should do it.`));
+  assert.strictEqual(calls.length, 1);
+  assert.match(text, /^Sure\./);
+  assert.match(text, /That should do it\.$/);
+  assert.doesNotMatch(text, /"name"/);
+});
+
+test('arguments arriving as a JSON string become the object the tool expects', () => {
+  const raw = '<tool_call>{"name":"read_file","arguments":"{\\"path\\":\\"a.js\\"}"}</tool_call>';
+  const { calls } = scanKnown(inPieces(raw));
+  assert.strictEqual(calls.length, 1);
+  assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { path: 'a.js' });
+});
+
+test('a namespaced name resolves to the tool that was actually offered', () => {
+  const { calls } = scanKnown(`<tool_call>{"name":"functions.read_file","arguments":{}}</tool_call>`);
+  assert.strictEqual(calls[0].function.name, 'read_file');
+});
+
+test('the near-miss key names a model reaches for still make a call', () => {
+  for (const key of ['tool_name', 'toolName', 'recipient_name']) {
+    const { calls } = scanKnown(`<tool_call>{"${key}":"read_file","arguments":{}}</tool_call>`);
+    assert.strictEqual(calls.length, 1, key);
+    assert.strictEqual(calls[0].function.name, 'read_file', key);
+  }
+  for (const key of ['parameters', 'args', 'input']) {
+    const { calls } = scanKnown(`<tool_call>{"name":"read_file","${key}":{"path":"a.js"}}</tool_call>`);
+    assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { path: 'a.js' }, key);
+  }
+});
+
+test('the OpenAI envelope a model copies from memory is unwrapped', () => {
+  const raw = '<tool_call>{"type":"function","function":{"name":"read_file",'
+    + '"arguments":{"path":"a.js"}}}</tool_call>';
+  const { calls } = scanKnown(inPieces(raw));
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].function.name, 'read_file');
+  assert.deepStrictEqual(JSON.parse(calls[0].function.arguments), { path: 'a.js' });
+});
+
+test('a list of calls is read as calls, not dropped as the wrong shape', () => {
+  const raw = `<tool_call>[${BARE},{"name":"write_file","arguments":{"path":"b.js"}}]</tool_call>`;
+  const { calls } = scanKnown(inPieces(raw));
+  assert.deepStrictEqual(calls.map((c) => c.function.name), ['read_file', 'write_file']);
+});
+
+/**
+ * The other half of finding untagged calls: an object naming something the client
+ * cannot run is an example, and an answer about JSON must survive being given.
+ */
+test('untagged JSON naming no offered tool stays in the chat as text', () => {
+  const example = 'Here is the shape:\n{"name":"some_service","arguments":{"a":1}}\nUse it as a guide.';
+  const { text, calls } = scanKnown(inPieces(example));
+  assert.strictEqual(calls.length, 0);
+  assert.strictEqual(text, example);
+});
+
+test('a truncated call is reported, but truncated prose is still delivered', () => {
+  const cut = '<tool_call>{"name":"write_file","arguments":{"content":"half a fi';
+  assert.match(scanKnown(inPieces(cut)).text, /could not be run/);
+
+  const prose = '{"name": "a curly brace walks into a bar" and the rest of the answer.';
+  assert.strictEqual(scanKnown(inPieces(prose)).text, prose);
+});
+
+test('the protocol tells the model to finish the task instead of checking in', () => {
+  const prompt = buildToolPrompt([{ name: 'read_file', description: '', parameters: {} }]);
+  assert.match(prompt, /automated agent loop/i);
+  assert.match(prompt, /Do not ask for permission/i);
+  assert.match(prompt, /TOOL RESULT/);
+  assert.match(prompt, /not with a question/i);
+  assert.match(prompt, /must be a JSON object, not a string/i);
+});
+
+test('an untagged call cut off mid-write keeps the continuation going', () => {
+  const { hasUnfinishedCall } = require('../src/toolshim');
+  const cut = 'Writing it now.\n{"name":"write_file","arguments":{"content":"half a fi';
+
+  assert.strictEqual(hasUnfinishedCall(cut, TOOLS), true, 'a cut-off call must be continued');
+  assert.strictEqual(
+    hasUnfinishedCall(`${cut}le"}}`, TOOLS), false, 'a finished call must not be',
+  );
+  assert.strictEqual(
+    hasUnfinishedCall('The config is {"name":"my service" and it goes on', TOOLS), false,
+    'prose naming no offered tool must not buy extra round trips',
+  );
+  assert.strictEqual(
+    hasUnfinishedCall(`<tool_call>${BARE}`, TOOLS), true, 'the tagged case still works',
+  );
+});
+
+/**
+ * The bug this pins passed every fixed-boundary test and failed on most random ones.
+ *
+ * `{"name":` is eight characters and a stream delivers a few at a time, so the buffer
+ * is `{"na` when it is looked at - too little to recognise, and every character of it
+ * went to the chat as prose before the rest of the call arrived. Whether a call leaked
+ * came down to where the chunk boundaries happened to fall.
+ */
+/**
+ * Every two-cut split of each shape, rather than a sample of random ones.
+ *
+ * Random chunking is the wrong instrument for this: the leak it is looking for lives
+ * at specific boundaries, so a run that misses them passes, and the same test fails
+ * on the next run with no code change. Every split is only a few thousand cases per
+ * shape and it is deterministic, so a failure names the boundary that broke.
+ *
+ * It has already earned its keep. The fenced case leaked its closing ``` on 2725 of
+ * 3160 splits because the wait branch of #takeUntagged stripped the opening fence
+ * without recording that the closing half was still to come - a defect the random
+ * version of this test reported as a single unreproducible failure.
+ */
+function everySplit(src, check) {
+  for (let i = 1; i < src.length; i++) {
+    for (let j = i + 1; j < src.length; j++) {
+      const scanner = new ToolCallScanner(null, TOOLS);
+      let text = '';
+      const calls = [];
+      for (const part of [src.slice(0, i), src.slice(i, j), src.slice(j)]) {
+        const out = scanner.push(part);
+        text += out.text;
+        calls.push(...out.calls);
+      }
+      const rest = scanner.flush();
+      text += rest.text;
+      calls.push(...rest.calls);
+      check(text, calls, `cut ${i},${j} of ${JSON.stringify(src)}`);
+    }
+  }
+}
+
+/** Anything here reaching the chat is markup the user was never meant to see. */
+const LEAK = /<\s*\/?\s*(?:tool[_\- ]?call|tool[_\- ]?use|function[_\- ]?call)|"arguments"\s*:|```/i;
+
+test('no chunking of a call leaks any of it into the chat', () => {
+  const BODY = '{"name": "write_file", "arguments": {"path": "a.js", "content": "let x = {a: 1};"}}';
+  const cases = [
+    ['canonical tagged', `<tool_call>${BARE}</tool_call>`, 1],
+    ['hyphenated tag', `<tool-call>${BARE}</tool-call>`, 1],
+    ['capitalised tag', `<Tool_Call>${BARE}</Tool_Call>`, 1],
+    ['spaced tag', `< tool_call >${BARE}</ tool_call >`, 1],
+    ['tool_use tag', `<tool_use>${BARE}</tool_use>`, 1],
+    ['function_call tag', `<function_call>${BARE}</function_call>`, 1],
+    ['json fence', `Now:\n\`\`\`json\n${BARE}\n\`\`\`\nDone.`, 1],
+    ['bare fence', `Now:\n\`\`\`\n${BARE}\n\`\`\`\n`, 1],
+    ['untagged, mid-reply', `I will read it.\n${BARE}\nNext.`, 1],
+    ['untagged, mid-sentence', `I think ${BARE} should do it.`, 1],
+    ['prose around a tagged call', `Let me look.\n<tool_call>${BARE}</tool_call>\nThat is it.`, 1],
+    ['two calls', `<tool_call>${BARE}</tool_call>\n<tool_call>${BODY}</tool_call>`, 2],
+    ['braces inside the arguments', `<tool_call>${BODY}</tool_call>`, 1],
+    ['a tagged call inside a fence', `\`\`\`\n<tool_call>${BARE}</tool_call>\n\`\`\`\n`, 1],
+    ['mangled closing tag', `<tool_call>${BARE}</tool_call}`, 1],
+    ['no closing tag at all', `<tool_call>${BARE}`, 1],
+  ];
+
+  for (const [label, src, want] of cases) {
+    everySplit(src, (text, calls, where) => {
+      assert.strictEqual(calls.length, want, `${label}: ${where} :: chat=${text}`);
+      assert.doesNotMatch(text, LEAK, `${label}: ${where}`);
+    });
+  }
+});
+
+/**
+ * The other half of the same bargain. Recognising more shapes as calls is only safe
+ * if prose that merely looks like one still arrives untouched - and an answer *about*
+ * tool calls is the likeliest thing a user asks for while debugging this plugin.
+ */
+test('no chunking turns prose into a tool call, or alters a character of it', () => {
+  const cases = [
+    'No tools needed. Here is a { and a < and a fence:\n```\nx = 1\n```\nend.',
+    'A tool call looks like {"name": "some_tool", "arguments": {}} in general.',
+    'Your config:\n```json\n{"compilerOptions": {"strict": true}}\n```\nThat is all.',
+    'The bug is on line 42 of app.js. Fix the off-by-one and you are done.',
+  ];
+  for (const src of cases) {
+    everySplit(src, (text, calls, where) => {
+      assert.strictEqual(calls.length, 0, `${where} :: became ${calls.length} call(s)`);
+      assert.strictEqual(text, src, where);
+    });
+  }
+});
+
+test('prose is never held hostage by a brace it happens to contain', () => {
+  const prose = 'No tools needed. Here is a { and a < and a fence:\n```\nx = 1\n```\nend.';
+  for (let trial = 0; trial < 200; trial++) {
+    const scanner = new ToolCallScanner(null, TOOLS);
+    let text = '';
+    for (let i = 0; i < prose.length;) {
+      const n = 1 + Math.floor(Math.random() * 9);
+      text += scanner.push(prose.slice(i, i + n)).text;
+      i += n;
+    }
+    text += scanner.flush().text;
+    assert.strictEqual(text, prose);
+  }
+});

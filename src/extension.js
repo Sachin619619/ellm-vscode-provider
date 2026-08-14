@@ -54,7 +54,7 @@ async function activate(context) {
  * Say so once, then never again.
  */
 async function promptIfUnconfigured(context, provider) {
-  const url = readSetting(context, 'url', '');
+  const url = readSetting(context, 'url');
   const token = await getToken(context);
   if (url && token) return;
 

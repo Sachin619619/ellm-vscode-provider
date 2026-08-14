@@ -19,7 +19,7 @@ const COOKIE_KEY = 'ellm.cookie';
  * Code's own storage - not in your repository, but not protected either.
  */
 function tokenStorageMode(context) {
-  return readSetting(context, 'tokenStorage', 'global');
+  return readSetting(context, 'tokenStorage');
 }
 
 async function getSecret(context, key) {
@@ -100,14 +100,54 @@ async function tokenLocation(context) {
 }
 
 /**
+ * The default declared for a setting in package.json.
+ *
+ * Read from the manifest rather than restated in code, because a default written
+ * twice eventually disagrees with itself and the disagreement is silent. That has
+ * already happened here: `maxContinuations` defaulted to 20 in the manifest and 8
+ * in the panel that edits it, so opening the panel and pressing Save - which reads
+ * the state back and writes it out again - cut the longest recoverable answer from
+ * roughly 100k chars to 40k, mid-task, with nothing said. It was fixed in v0.4.1
+ * and came back with the v0.5.0 revert, which is the second reason not to leave
+ * the value anywhere it can be reverted independently.
+ *
+ * `schema` is injectable only so tests need not run inside an extension host.
+ */
+let SCHEMA = null;
+function settingDefaults(schema) {
+  if (schema) SCHEMA = schema;
+  if (!SCHEMA) {
+    // eslint-disable-next-line global-require
+    const props = require('../package.json').contributes.configuration.properties;
+    SCHEMA = Object.fromEntries(
+      Object.entries(props).map(([k, v]) => [k.replace(/^ellm\./, ''), v.default]),
+    );
+  }
+  return SCHEMA;
+}
+
+/** The manifest's default for `key`. Throws for a key the manifest does not declare. */
+function defaultFor(key) {
+  const defaults = settingDefaults();
+  if (!(key in defaults)) {
+    throw new Error(`ellm.${key} is read but not declared in package.json`);
+  }
+  return defaults[key];
+}
+
+/**
  * Settings value, preferring the fallback written when settings.json was unwritable.
  * A malformed user settings.json is common and unrelated to this extension, but it
  * would otherwise make the extension impossible to configure.
+ *
+ * The default comes from the manifest unless one is passed explicitly, so callers
+ * cannot drift apart from the schema or from each other.
  */
 function readSetting(context, key, fallbackDefault) {
   const stored = context.globalState.get(`fallback.${key}`);
   if (stored !== undefined) return stored;
-  return vscode.workspace.getConfiguration('ellm').get(key, fallbackDefault);
+  const fallback = fallbackDefault === undefined ? defaultFor(key) : fallbackDefault;
+  return vscode.workspace.getConfiguration('ellm').get(key, fallback);
 }
 
 /** Writes settings, tolerating a settings.json VS Code refuses to touch. */
@@ -135,4 +175,5 @@ module.exports = {
   TOKEN_KEY, COOKIE_KEY, getToken, setToken, clearToken, tokenLocation,
   getSecret, setSecret, clearSecret, getCookie, setCookie,
   getPrivate, setPrivate, readSetting, saveSettings, tokenStorageMode,
+  defaultFor, settingDefaults,
 };
