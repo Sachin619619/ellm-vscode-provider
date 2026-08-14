@@ -50,6 +50,8 @@ async function main() {
         ELLM_TEST_CHAT_PATH: process.env.ELLM_TEST_CHAT_PATH,
         ELLM_TEST_PROMPT_FIELD: process.env.ELLM_TEST_PROMPT_FIELD,
         ELLM_TEST_AUTH_HEADER: process.env.ELLM_TEST_AUTH_HEADER,
+        ELLM_TEST_MESSAGES_FIELD: process.env.ELLM_TEST_MESSAGES_FIELD,
+        ELLM_TEST_MESSAGES_FORMAT: process.env.ELLM_TEST_MESSAGES_FORMAT,
         ELLM_TEST_WORKSPACE: workspace,
         ELLM_RESULT_FILE: process.env.ELLM_RESULT_FILE,
       },

@@ -71,6 +71,8 @@ gateways there is nothing to write at all:
 | `ellm.models` | model names, comma separated | — |
 | `ellm.textPath` | dot-path to the text in a frame | *(auto-detect)* |
 | `ellm.contextChars` | prompt characters the backend accepts | `400000` |
+| `ellm.messagesField` | body key for a real message array | *(off — flattened)* |
+| `ellm.messagesFormat` | `openai` / `speaker` / `anthropic` | `openai` |
 | `ellm.imageField` | body key holding attached images | *(text-only)* |
 
 ### Attaching images
@@ -302,6 +304,34 @@ comes from the `contributes.configuration` block in `package.json` and nowhere e
 panel and the provider both read it rather than restating it, because the version that
 restated it disagreed with itself, and pressing **Save** then quietly cut `maxContinuations`
 from 20 to 8 and with it the longest answer that could still be recovered.
+
+## Sending a real message array
+
+By default the whole conversation is flattened into **one prompt string**, labelled
+`System:` / `User:` / `Assistant:`, because the original backend took a single prompt and kept
+history itself. That works, but the labels are just words inside a string: nothing separates an
+instruction the model must obey from a quotation of one, and a file whose contents happen to
+contain `User:` reads as a turn boundary.
+
+If your backend accepts a real array, set **`ellm.messagesField`** to the body key (usually
+`messages`) and pick a shape with **`ellm.messagesFormat`**:
+
+| format | each element | notes |
+|---|---|---|
+| `openai` | `{ role: system\|user\|assistant, content: "…" }` | the default |
+| `speaker` | `{ speaker: system\|human\|assistant, utterance: "…" }` | |
+| `anthropic` | `{ role: user\|assistant, content: [{ type: "text", text }] }` | system text is hoisted to a top-level `system` field, which is where that API wants it |
+
+The array **replaces** the flattened prompt — sending both would show the backend every turn
+twice.
+
+> **Verify it before trusting it.** This is opt-in for a reason: a backend handed a body field it
+> does not recognise does not complain. It ignores the field, answers from whatever it *did*
+> understand, and returns a perfectly ordinary reply — so a conversation that was never delivered
+> looks exactly like one that was. Set `ellm.logRequestBody` to `keys`, make one request, and read
+> the payload in the **Enterprise LLM** output channel: the conversation shows up as
+> `system(2688 chars) user(64 chars) assistant(79 chars)`. If the reply is fine but that line is
+> missing or the array is empty, the field name is wrong.
 
 ## Try it without a real backend
 

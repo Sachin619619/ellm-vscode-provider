@@ -23,6 +23,10 @@ async function activate(context) {
       promptField: process.env.ELLM_TEST_PROMPT_FIELD || 'prompt',
       models: process.env.ELLM_TEST_MODELS || '',
       authHeader: process.env.ELLM_TEST_AUTH_HEADER || 'X-Corp-Auth',
+      // Empty is the real default here, not a missing value - it selects the
+      // flattened prompt - so this seeds '' rather than falling back to anything.
+      messagesField: process.env.ELLM_TEST_MESSAGES_FIELD || '',
+      messagesFormat: process.env.ELLM_TEST_MESSAGES_FORMAT || 'openai',
     });
     await setToken(context, process.env.ELLM_TEST_TOKEN);
     output.appendLine(`seeded connection from env: ${process.env.ELLM_TEST_URL}`);

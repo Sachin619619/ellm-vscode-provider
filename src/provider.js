@@ -103,6 +103,12 @@ class EllmChatProvider {
       // though the case is covered.
       contextChars: readSetting(this.context, 'contextChars'),
       imageField: readSetting(this.context, 'imageField'),
+      // Empty keeps the flattened prompt every earlier version sent. Naming a key
+      // sends the conversation as a real message array instead - opt-in, because a
+      // backend handed a field it does not know does not complain, it just answers
+      // from whatever it did understand.
+      messagesField: readSetting(this.context, 'messagesField'),
+      messagesFormat: readSetting(this.context, 'messagesFormat'),
       // Identity and tuning are private to this machine - see storage.js.
       identity: getPrivate(this.context, 'identity', {}),
       params: getPrivate(this.context, 'params', {}),
@@ -346,7 +352,13 @@ class EllmChatProvider {
     const mode = readSetting(this.context, 'logRequestBody');
     if (mode === 'keys' || mode === 'full') {
       this.log(`request payload (${mode}):\n${describeRequest(
-        { url, body, headers, promptField: readSetting(this.context, 'promptField') },
+        {
+          url,
+          body,
+          headers,
+          promptField: readSetting(this.context, 'promptField'),
+          messagesField: readSetting(this.context, 'messagesField'),
+        },
         { values: mode === 'full' },
       )}`);
     }

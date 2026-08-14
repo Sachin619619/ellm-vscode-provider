@@ -56,6 +56,20 @@ const DEFAULT_MODEL_FIELD = 'model';
 const DEFAULT_CONTEXT_CHARS = 400000;
 
 /**
+ * Shapes a conversation array can take, for backends that accept one.
+ *
+ *   openai     [{role: "system"|"user"|"assistant", content: "…"}]
+ *   speaker    [{speaker: "system"|"human"|"assistant", utterance: "…"}]
+ *   anthropic  [{role: "user"|"assistant", content: [{type:"text", text:"…"}]}]
+ *              with the system text hoisted to a top-level `system` field, which
+ *              is where that API expects it - inline, it reads as the user talking
+ *
+ * Which one a gateway wants is not discoverable from here, so it is configuration.
+ */
+const MESSAGE_FORMATS = ['openai', 'speaker', 'anthropic'];
+const DEFAULT_MESSAGES_FORMAT = 'openai';
+
+/**
  * Characters per token, for turning a char budget into the token counts VS Code
  * speaks. One constant, used by both `provideTokenCount` and `maxInputTokens`,
  * because those two have to agree: VS Code fills the window by counting with the
@@ -349,7 +363,7 @@ const TOKEN_LIMIT_KEY = /^(max|min|num|n|total|input|output|prompt|completion)[_
  * Everything that decides *which model answers* is shown in full - that is the
  * whole point of looking.
  */
-function describeRequest({ url, body, headers, promptField }, { values = true } = {}) {
+function describeRequest({ url, body, headers, promptField, messagesField }, { values = true } = {}) {
   const mask = (key, value) => {
     if (key === promptField) {
       const len = String(value ?? '').length;
@@ -369,6 +383,21 @@ function describeRequest({ url, body, headers, promptField }, { values = true } 
   };
 
   const walk = (value, key) => {
+    // The conversation array is the prompt wearing a different shape, so it gets
+    // the same treatment: roles and sizes, never the text. Printed in full it is
+    // the entire session - every file the agent has read - which both buries the
+    // fields this view exists to compare and puts the work on screen.
+    if (messagesField && key === messagesField && Array.isArray(value)) {
+      return value.map((m) => {
+        const role = m?.role ?? m?.speaker ?? '?';
+        const text = typeof m?.content === 'string'
+          ? m.content
+          : (m?.utterance ?? (Array.isArray(m?.content)
+            ? m.content.map((p) => p?.text ?? '').join('')
+            : ''));
+        return `${role}(${String(text).length} chars)`;
+      });
+    }
     if (Array.isArray(value)) return value.map((v) => walk(v, key));
     if (value && typeof value === 'object') {
       return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, k)]));
@@ -458,7 +487,7 @@ class CorpClient {
   constructor({
     url, token, authHeader, authPrefix, cookie, chatPath, promptField, modelField,
     model, models, identity, params, textPath, servedModelPath,
-    contextChars, maxResponseChars, imageField,
+    contextChars, maxResponseChars, imageField, messagesField, messagesFormat,
   } = {}) {
     // Which body key carries the prompt is the backend's business, not this file's.
     this.promptField = promptField || DEFAULT_PROMPT_FIELD;
@@ -484,6 +513,12 @@ class CorpClient {
     this.imageField = imageField || '';
     this.contextChars = contextChars || DEFAULT_CONTEXT_CHARS;
     this.maxResponseChars = maxResponseChars || 5000;
+    // Empty keeps the flattened single prompt, which is what every version before
+    // this one sent. Naming a key switches the conversation to a real message
+    // array under it - see toMessages for why this is opt-in rather than detected.
+    this.messagesField = messagesField || '';
+    this.messagesFormat = MESSAGE_FORMATS.includes(messagesFormat)
+      ? messagesFormat : DEFAULT_MESSAGES_FORMAT;
   }
 
   get configured() {
@@ -527,12 +562,68 @@ class CorpClient {
    * itself, keyed by conversation id. VS Code already replays the whole
    * conversation every turn, so history is flattened in here and server-side
    * memory is left off; otherwise every turn would be remembered twice.
+   *
+   * Flattening is lossy in a way that matters. `System:` and `User:` become
+   * ordinary words inside one string, so nothing separates an instruction from a
+   * quotation of one, and a file whose contents happen to contain "User:" reads as
+   * a turn boundary. If the backend accepts a real message array, `messagesField`
+   * turns this off - see toMessages.
    */
   toPrompt(turns) {
     const label = { system: 'System', human: 'User', assistant: 'Assistant' };
     if (turns.length === 1) return this.utteranceOf(turns[0]);
     return turns
       .map((t) => `${label[t.speaker] ?? 'User'}: ${this.utteranceOf(t)}`)
+      .join('\n\n');
+  }
+
+  /**
+   * The conversation as a real message array, for a backend that accepts one.
+   *
+   * Off unless `messagesField` names a body key, because whether a given gateway
+   * takes an array - and under which key, in which shape - cannot be guessed from
+   * here and a wrong guess is not a clean failure: a backend handed a field it does
+   * not know ignores it, answers from whatever it *did* understand, and returns a
+   * perfectly ordinary-looking reply. So the shape is configuration, and the
+   * flattened prompt stays the default.
+   *
+   * Worth turning on where it works: the model is fronted by a real chat API, and
+   * roles are how that API separates instructions it must obey from text it is
+   * merely being shown. Flattened, they are the same thing.
+   */
+  toMessages(turns) {
+    const openaiRole = { system: 'system', human: 'user', assistant: 'assistant' };
+
+    if (this.messagesFormat === 'speaker') {
+      return turns.map((t) => ({
+        speaker: t.speaker === 'human' ? 'human' : (t.speaker ?? 'human'),
+        utterance: this.utteranceOf(t),
+      }));
+    }
+
+    if (this.messagesFormat === 'anthropic') {
+      // No system role in the messages array - it is a separate top-level field,
+      // and a system turn left inline is silently treated as the user talking.
+      // body() hoists it; here the system turns are simply left out.
+      return turns
+        .filter((t) => t.speaker !== 'system')
+        .map((t) => ({
+          role: t.speaker === 'assistant' ? 'assistant' : 'user',
+          content: [{ type: 'text', text: this.utteranceOf(t) }],
+        }));
+    }
+
+    return turns.map((t) => ({
+      role: openaiRole[t.speaker] ?? 'user',
+      content: this.utteranceOf(t),
+    }));
+  }
+
+  /** The system text Anthropic-shaped bodies carry outside the messages array. */
+  systemOf(turns) {
+    return turns
+      .filter((t) => t.speaker === 'system')
+      .map((t) => this.utteranceOf(t))
       .join('\n\n');
   }
 
@@ -565,6 +656,19 @@ class CorpClient {
 
   body({ modelAlias, turns }) {
     const images = this.imageField ? this.imagesIn(turns) : [];
+
+    // The conversation goes in exactly one way. Sending the array AND the
+    // flattened prompt would put every turn in the body twice, and a backend that
+    // reads both answers a conversation it has been shown double.
+    const conversation = this.messagesField
+      ? {
+        [this.messagesField]: this.toMessages(turns),
+        ...(this.messagesFormat === 'anthropic' && this.systemOf(turns)
+          ? { system: this.systemOf(turns) }
+          : {}),
+      }
+      : { [this.promptField]: this.toPrompt(turns) };
+
     return {
       ...this.identity, // whatever extra fields the backend expects, verbatim
       ...this.params, // tuning knobs, exactly as configured
@@ -572,7 +676,7 @@ class CorpClient {
       // extra fields. It cannot win over a *differently named* field, which is
       // what modelFieldConflicts is for.
       [this.modelField]: modelAlias || this.model,
-      [this.promptField]: this.toPrompt(turns),
+      ...conversation,
       ...(images.length ? { [this.imageField]: images } : {}),
       stream: true,
     };

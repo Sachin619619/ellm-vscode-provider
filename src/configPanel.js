@@ -42,6 +42,8 @@ function openConfigPanel(context, provider) {
       maxResponseChars: readSetting(context, 'maxResponseChars'),
       maxContinuations: readSetting(context, 'maxContinuations'),
       contextChars: readSetting(context, 'contextChars'),
+      messagesField: readSetting(context, 'messagesField'),
+      messagesFormat: readSetting(context, 'messagesFormat'),
     });
   };
 
@@ -89,6 +91,11 @@ function openConfigPanel(context, provider) {
         const servedModelPath = String(msg.servedModelPath || '').trim();
         const logRequestBody = ['off', 'keys', 'full'].includes(msg.logRequestBody)
           ? msg.logRequestBody : defaultFor('logRequestBody');
+        // Blank is meaningful here - it means "flatten", the pre-0.7.0 behaviour -
+        // so this one must NOT fall back to a default the way the others do.
+        const messagesField = String(msg.messagesField || '').trim();
+        const messagesFormat = ['openai', 'speaker', 'anthropic'].includes(msg.messagesFormat)
+          ? msg.messagesFormat : defaultFor('messagesFormat');
 
         warnings.push(await saveSettings(context, {
           url,
@@ -104,6 +111,8 @@ function openConfigPanel(context, provider) {
           maxResponseChars: Number(msg.maxResponseChars) || defaultFor('maxResponseChars'),
           maxContinuations: Number(msg.maxContinuations) || defaultFor('maxContinuations'),
           contextChars: Number(msg.contextChars) || defaultFor('contextChars'),
+          messagesField,
+          messagesFormat,
         }));
 
         const token = await getToken(context);
@@ -123,6 +132,10 @@ function openConfigPanel(context, provider) {
           servedModelPath,
           identity,
           params,
+          // Save & Test must send the same body shape a real turn will, or it
+          // reports a working connection for a payload the backend never sees.
+          messagesField,
+          messagesFormat,
         });
 
         // There is no discovery endpoint to ping, so the test is a real (tiny)
@@ -200,6 +213,7 @@ async function smokeTest(client) {
       body: shape.body,
       headers: shape.headers,
       promptField: client.promptField,
+      messagesField: client.messagesField,
     })}`;
     if (shape.conflicts.length) {
       // The panel is where this belongs: it is the one place that can see both the
@@ -368,6 +382,28 @@ function html(webview) {
     it truncates from the front, where the tool definitions are.</span></label>
   <input id="contextChars" type="number" min="0" />
 
+  <div class="grid">
+    <div>
+      <label>Messages field
+        <span class="hint">— blank = one flattened prompt</span></label>
+      <input id="messagesField" placeholder="(off — e.g. messages)" />
+    </div>
+    <div>
+      <label>Messages format <span class="hint">— shape of each element</span></label>
+      <select id="messagesFormat">
+        <option value="openai">openai — {role, content}</option>
+        <option value="speaker">speaker — {speaker, utterance}</option>
+        <option value="anthropic">anthropic — content parts + system</option>
+      </select>
+    </div>
+  </div>
+  <p class="hint">Send the conversation as a real message array instead of one
+  flattened string, so system instructions stay distinguishable from text the model
+  is merely shown. Only set this if the backend accepts an array — one that does not
+  will ignore the field and answer anyway, so the reply looks fine while the
+  conversation was never delivered. Set <b>Log request payload</b> to <b>keys</b> and
+  compare the output channel against DevTools before trusting it.</p>
+
   <div class="actions">
     <button id="save">Save &amp; Test</button>
     <button id="clear" class="secondary">Clear credentials</button>
@@ -397,6 +433,8 @@ function html(webview) {
       $('maxResponseChars').value = m.maxResponseChars;
       $('maxContinuations').value = m.maxContinuations;
       $('contextChars').value = m.contextChars;
+      $('messagesField').value = m.messagesField || '';
+      $('messagesFormat').value = m.messagesFormat || 'openai';
       $('saved').textContent = m.tokenLocation
         ? 'Token saved in ' + m.tokenLocation + '. Leave blank to keep it.'
         : 'No token saved yet.';
@@ -433,6 +471,8 @@ function html(webview) {
       maxResponseChars: $('maxResponseChars').value,
       maxContinuations: $('maxContinuations').value,
       contextChars: $('contextChars').value,
+      messagesField: $('messagesField').value,
+      messagesFormat: $('messagesFormat').value,
     });
     $('token').value = '';
     $('cookie').value = '';

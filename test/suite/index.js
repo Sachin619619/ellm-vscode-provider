@@ -5,6 +5,10 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const storage = require('../../src/storage');
+const { CorpClient } = require('../../src/corpClient');
+
+/** The extension's settings section, read the same way the extension reads it. */
+const cfg = () => vscode.workspace.getConfiguration('ellm');
 
 const results = [];
 function check(name, pass, detail = '') {
@@ -56,6 +60,42 @@ async function run() {
     check('vscode.lm.selectChatModels finds the enterprise models', models.length > 0,
       models.map((m) => m.id).join(', ') || 'none');
     if (!models.length) return report(started);
+
+    // Which body shape this run actually sent.
+    //
+    // A green suite proves the plugin works, not that it sent what you meant it to
+    // send: a backend handed an array it does not understand ignores the field and
+    // answers from whatever else it found, so every check below can pass while the
+    // conversation was never delivered. Only the request side can settle it, so the
+    // body is built here from the same settings and inspected directly.
+    const wanted = process.env.ELLM_TEST_MESSAGES_FIELD || '';
+    const built = new CorpClient({
+      url: cfg().get('url'),
+      token: 'probe',
+      models: [models[0].id],
+      promptField: cfg().get('promptField'),
+      messagesField: cfg().get('messagesField'),
+      messagesFormat: cfg().get('messagesFormat'),
+    }).body({
+      modelAlias: models[0].id,
+      turns: [
+        { speaker: 'system', utterance: 'sys' },
+        { speaker: 'human', utterance: 'hello' },
+      ],
+    });
+
+    if (wanted) {
+      check(`the conversation goes out as an array under "${wanted}"`,
+        Array.isArray(built[wanted]) && built[wanted].length > 0,
+        JSON.stringify(built[wanted] ?? null).slice(0, 120));
+      check('the flattened prompt is not sent alongside it',
+        !(cfg().get('promptField') in built),
+        'sending both would show the backend every turn twice');
+    } else {
+      check('the conversation goes out as one flattened prompt',
+        typeof built[cfg().get('promptField')] === 'string',
+        `${String(built[cfg().get('promptField')] ?? '').length} chars`);
+    }
 
     const model = models[0];
     check('model is usable by agents (toolCalling)', model.capabilities?.toolCalling !== false, String(model.id));
@@ -154,7 +194,6 @@ async function run() {
  * ExtensionContext rather than a stub, since that is where the refusals happen.
  */
 async function checkStorage(context) {
-  const cfg = () => vscode.workspace.getConfiguration('ellm');
   const originalMode = cfg().get('tokenStorage', 'global');
   const originalToken = await storage.getToken(context);
   const probe = `probe-token-${Date.now()}`;

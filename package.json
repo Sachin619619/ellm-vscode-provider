@@ -2,7 +2,7 @@
   "name": "ellm-provider",
   "displayName": "Enterprise LLM Provider",
   "description": "Use a chat-only, token-authenticated enterprise LLM as a model in VS Code chat and agent mode",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "sachin",
   "license": "MIT",
   "engines": {
@@ -65,6 +65,26 @@
           "type": "number",
           "default": 20,
           "description": "Safety limit on how many times one answer may be continued. A file written through the response cap needs one round per cap-full of text, so a large file needs many."
+        },
+        "ellm.messagesField": {
+          "type": "string",
+          "default": "",
+          "description": "Body key to send the conversation under as a real message array (e.g. \"messages\"). Leave empty to send one flattened prompt string under ellm.promptField, which is what every version before 0.7.0 did. Only set this if the backend actually accepts an array: one that does not will ignore the field and answer from whatever else it understood, so the reply looks normal while the conversation was never delivered. Check the request in the output channel with ellm.logRequestBody."
+        },
+        "ellm.messagesFormat": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "speaker",
+            "anthropic"
+          ],
+          "default": "openai",
+          "enumDescriptions": [
+            "[{ role: system|user|assistant, content: \"…\" }]",
+            "[{ speaker: system|human|assistant, utterance: \"…\" }]",
+            "[{ role: user|assistant, content: [{ type: text, text }] }] with system hoisted to a top-level `system` field"
+          ],
+          "description": "Shape of each element of ellm.messagesField. Ignored when that setting is empty."
         },
         "ellm.contextChars": {
           "type": "number",
